@@ -13,14 +13,6 @@ import streamlit.components.v1 as components
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_USERNAME = "469Vini"
 
-SECURITY_QUESTIONS = {
-    1: "Wie hieß dein erstes Haustier?",
-    2: "In welcher Stadt bist du geboren?",
-    3: "Wie hieß deine erste Schule?",
-    4: "Was ist der Vorname deiner Mutter?",
-    5: "Wie hieß dein Kindheits-Idol oder bester Freund?"
-}
-
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ist nicht gesetzt. Bitte als Umgebungsvariable in Render hinterlegen.")
@@ -36,16 +28,12 @@ def init_db():
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             display_name TEXT NOT NULL,
-            sq1_id INTEGER,
-            sq1_salt TEXT,
-            sq1_hash TEXT,
-            sq2_id INTEGER,
-            sq2_salt TEXT,
-            sq2_hash TEXT,
-            is_admin BOOLEAN DEFAULT FALSE
+            is_admin BOOLEAN DEFAULT FALSE,
+            password_reset_allowed BOOLEAN DEFAULT FALSE
         )
     """)
     c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE")
+    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_allowed BOOLEAN DEFAULT FALSE")
     c.execute("UPDATE users SET is_admin = TRUE WHERE username = %s", (ADMIN_USERNAME,))
     conn.commit()
     c.execute("""
@@ -123,28 +111,21 @@ def init_db():
         conn.commit()
     conn.close()
 
-def hash_text(text, salt):
-    return hashlib.sha256((salt + text.strip().lower()).encode()).hexdigest()
-
 def hash_password(password, salt):
     return hashlib.sha256((salt + password).encode()).hexdigest()
 
-def create_user(username, password, display_name, sq1_id, sq1_answer, sq2_id, sq2_answer):
+def create_user(username, password, display_name):
     conn = get_conn()
     salt = secrets.token_hex(8)
     ph = hash_password(password, salt)
-    sq1_salt = secrets.token_hex(8)
-    sq2_salt = secrets.token_hex(8)
-    sq1_hash = hash_text(sq1_answer, sq1_salt)
-    sq2_hash = hash_text(sq2_answer, sq2_salt)
     ok = True
     try:
         c = conn.cursor()
         c.execute(
             """INSERT INTO users
-               (username, password_hash, salt, display_name, sq1_id, sq1_salt, sq1_hash, sq2_id, sq2_salt, sq2_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (username, ph, salt, display_name, sq1_id, sq1_salt, sq1_hash, sq2_id, sq2_salt, sq2_hash)
+               (username, password_hash, salt, display_name, is_admin, password_reset_allowed)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            (username, ph, salt, display_name, False, False)
         )
         conn.commit()
     except psycopg2.IntegrityError:
@@ -172,44 +153,43 @@ def verify_login(username, password):
         return {"id": user_id, "display_name": display_name, "username": username, "is_admin": bool(is_admin)}
     return None
 
-def get_security_questions_for_user(username):
+def is_password_reset_allowed(username):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("SELECT id, sq1_id, sq2_id FROM users WHERE username = %s", (username,))
-        row = c.fetchone()
-    finally:
-        conn.close()
-    return row
-
-def verify_security_answers(username, answer1, answer2):
-    conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, sq1_salt, sq1_hash, sq2_salt, sq2_hash FROM users WHERE username = %s",
-            (username,)
-        )
+        c.execute("SELECT id, password_reset_allowed FROM users WHERE username = %s", (username,))
         row = c.fetchone()
     finally:
         conn.close()
     if row is None:
-        return None
-    user_id, sq1_salt, sq1_hash, sq2_salt, sq2_hash = row
-    if sq1_salt is None or sq2_salt is None:
-        return None
-    if hash_text(answer1, sq1_salt) == sq1_hash and hash_text(answer2, sq2_salt) == sq2_hash:
-        return user_id
-    return None
+        return None, False
+    return row[0], bool(row[1])
 
-def reset_password(user_id, new_password):
+def set_password_reset_allowed(target_user_id, allowed):
     conn = get_conn()
     try:
         c = conn.cursor()
+        c.execute("UPDATE users SET password_reset_allowed = %s WHERE id = %s", (allowed, target_user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def perform_one_time_password_reset(user_id, new_password):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT password_reset_allowed FROM users WHERE id = %s", (user_id,))
+        row = c.fetchone()
+        if row is None or not bool(row[0]):
+            return False
         new_salt = secrets.token_hex(8)
         new_hash = hash_password(new_password, new_salt)
-        c.execute("UPDATE users SET password_hash = %s, salt = %s WHERE id = %s", (new_hash, new_salt, user_id))
+        c.execute(
+            "UPDATE users SET password_hash = %s, salt = %s, password_reset_allowed = FALSE WHERE id = %s",
+            (new_hash, new_salt, user_id)
+        )
         conn.commit()
+        return True
     finally:
         conn.close()
 
@@ -275,7 +255,7 @@ def get_all_users_overview():
     conn = get_conn()
     try:
         df = pd.read_sql(
-            "SELECT id, username, display_name, is_admin FROM users ORDER BY id",
+            "SELECT id, username, display_name, is_admin, password_reset_allowed FROM users ORDER BY id",
             conn
         )
     finally:
@@ -680,7 +660,7 @@ except Exception as e:
     st.error(f"Fehler bei der Datenbank-Initialisierung: {e}")
     st.stop()
 
-st.set_page_config(page_title="Bierball League", layout="wide")
+st.set_page_config(page_title="Bassi Bierball", layout="wide")
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -696,46 +676,83 @@ if st.session_state.user is None and "remember_token" in query_params:
         pass
 
 if st.session_state.user is None:
-    st.title("Bierball League – Login")
-    login_tab, register_tab, reset_tab = st.tabs(["Anmelden", "Registrieren", "Passwort vergessen?"])
+    if "pending_reset_username" not in st.session_state:
+        st.session_state.pending_reset_username = None
+
+    st.title("Bassi Bierball – Login")
+    login_tab, register_tab = st.tabs(["Anmelden", "Registrieren"])
 
     with login_tab:
-        with st.form("login_form"):
-            u = st.text_input("Benutzername")
-            p = st.text_input("Passwort", type="password")
-            remember_me = st.checkbox("Angemeldet bleiben", value=True)
-            submitted = st.form_submit_button("Anmelden")
-            if submitted:
-                if not u.strip() or not p:
-                    st.warning("Bitte Benutzername und Passwort eingeben.")
-                else:
-                    try:
-                        result = verify_login(u.strip(), p)
-                    except Exception as e:
-                        st.error(f"Technischer Fehler beim Login: {e}")
-                        result = None
-                    if result:
-                        st.session_state.user = result
-                        if remember_me:
-                            token = create_remember_token(result["id"])
-                            st.query_params["remember_token"] = token
-                        st.rerun()
+        if st.session_state.pending_reset_username:
+            pw_username = st.session_state.pending_reset_username
+            st.warning(f"Für den Account **{pw_username}** wurde ein einmaliger Passwort-Reset vom Admin freigeschaltet. Bitte setze jetzt ein neues Passwort.")
+            with st.form("password_reset_form"):
+                reset_new_pw = st.text_input("Neues Passwort", type="password", key="reset_new_pw_login")
+                reset_new_pw2 = st.text_input("Neues Passwort wiederholen", type="password", key="reset_new_pw2_login")
+                reset_submit = st.form_submit_button("Neues Passwort setzen")
+                if reset_submit:
+                    if not reset_new_pw or reset_new_pw != reset_new_pw2:
+                        st.warning("Die Passwörter stimmen nicht überein oder sind leer.")
+                    elif len(reset_new_pw) < 4:
+                        st.warning("Das Passwort sollte mindestens 4 Zeichen haben.")
                     else:
-                        st.error("Benutzername oder Passwort falsch.")
+                        target_uid, allowed = is_password_reset_allowed(pw_username)
+                        if target_uid and allowed:
+                            reset_success = perform_one_time_password_reset(target_uid, reset_new_pw)
+                            if reset_success:
+                                st.session_state.pending_reset_username = None
+                                st.success("Passwort erfolgreich geändert. Du kannst dich jetzt mit deinem neuen Passwort anmelden.")
+                                st.rerun()
+                            else:
+                                st.error("Der Passwort-Reset ist nicht mehr gültig. Bitte wende dich an den Admin.")
+                                st.session_state.pending_reset_username = None
+                                st.rerun()
+                        else:
+                            st.error("Der Passwort-Reset ist nicht mehr gültig. Bitte wende dich an den Admin.")
+                            st.session_state.pending_reset_username = None
+                            st.rerun()
+            if st.button("Abbrechen", key="cancel_reset"):
+                st.session_state.pending_reset_username = None
+                st.rerun()
+        else:
+            with st.form("login_form"):
+                u = st.text_input("Benutzername")
+                p = st.text_input("Passwort", type="password")
+                remember_me = st.checkbox("Angemeldet bleiben", value=True)
+                submitted = st.form_submit_button("Anmelden")
+                if submitted:
+                    if not u.strip() or not p:
+                        st.warning("Bitte Benutzername und Passwort eingeben.")
+                    else:
+                        try:
+                            result = verify_login(u.strip(), p)
+                        except Exception as e:
+                            st.error(f"Technischer Fehler beim Login: {e}")
+                            result = None
+                        if result:
+                            st.session_state.user = result
+                            if remember_me:
+                                token = create_remember_token(result["id"])
+                                st.query_params["remember_token"] = token
+                            st.rerun()
+                        else:
+                            try:
+                                target_uid, allowed = is_password_reset_allowed(u.strip())
+                            except Exception:
+                                target_uid, allowed = None, False
+                            if target_uid and allowed:
+                                st.session_state.pending_reset_username = u.strip()
+                                st.rerun()
+                            else:
+                                st.error("Benutzername oder Passwort falsch.")
 
     with register_tab:
-        st.caption("Wähle zwei unterschiedliche Sicherheitsfragen – damit kannst du später dein Passwort zurücksetzen, falls du es vergisst.")
+        st.caption("Wähle einen Benutzernamen und ein Passwort. Falls du dein Passwort später vergisst, kann der Admin einen einmaligen Passwort-Reset für dich freischalten.")
         with st.form("register_form"):
             new_u = st.text_input("Benutzername wählen")
             new_dn = st.text_input("Anzeigename")
             new_p = st.text_input("Passwort", type="password")
             new_p2 = st.text_input("Passwort wiederholen", type="password")
-            q_options = list(SECURITY_QUESTIONS.items())
-            sq1_choice = st.selectbox("Sicherheitsfrage 1", q_options, format_func=lambda x: x[1], key="sq1_choice")
-            sq1_answer = st.text_input("Antwort 1")
-            remaining_q = [q for q in q_options if q[0] != sq1_choice[0]]
-            sq2_choice = st.selectbox("Sicherheitsfrage 2", remaining_q, format_func=lambda x: x[1], key="sq2_choice")
-            sq2_answer = st.text_input("Antwort 2")
             reg_submitted = st.form_submit_button("Account erstellen")
             if reg_submitted:
                 if not new_u.strip() or not new_p or not new_dn.strip():
@@ -744,14 +761,9 @@ if st.session_state.user is None:
                     st.warning("Die beiden Passwörter stimmen nicht überein.")
                 elif len(new_p) < 4:
                     st.warning("Das Passwort sollte mindestens 4 Zeichen haben.")
-                elif not sq1_answer.strip() or not sq2_answer.strip():
-                    st.warning("Bitte beide Sicherheitsfragen beantworten.")
                 else:
                     try:
-                        success = create_user(
-                            new_u.strip(), new_p, new_dn.strip(),
-                            sq1_choice[0], sq1_answer, sq2_choice[0], sq2_answer
-                        )
+                        success = create_user(new_u.strip(), new_p, new_dn.strip())
                     except Exception as e:
                         st.error(f"Technischer Fehler bei der Registrierung: {e}")
                         success = False
@@ -759,41 +771,6 @@ if st.session_state.user is None:
                         st.success("Account erstellt! Du kannst dich jetzt anmelden.")
                     else:
                         st.warning("Dieser Benutzername ist bereits vergeben.")
-
-    with reset_tab:
-        st.subheader("Passwort zurücksetzen")
-        reset_username = st.text_input("Dein Benutzername", key="reset_username")
-        if reset_username.strip():
-            try:
-                q_row = get_security_questions_for_user(reset_username.strip())
-            except Exception:
-                q_row = None
-            if q_row is None:
-                st.info("Benutzername nicht gefunden.")
-            elif q_row[1] is None or q_row[2] is None:
-                st.warning("Für diesen Account wurden noch keine Sicherheitsfragen hinterlegt.")
-            else:
-                _, sq1_id, sq2_id = q_row
-                with st.form("reset_form"):
-                    st.write(f"**{SECURITY_QUESTIONS[sq1_id]}**")
-                    a1 = st.text_input("Antwort 1", key="reset_a1")
-                    st.write(f"**{SECURITY_QUESTIONS[sq2_id]}**")
-                    a2 = st.text_input("Antwort 2", key="reset_a2")
-                    new_pw = st.text_input("Neues Passwort", type="password", key="reset_new_pw")
-                    new_pw2 = st.text_input("Neues Passwort wiederholen", type="password", key="reset_new_pw2")
-                    reset_submitted = st.form_submit_button("Passwort zurücksetzen")
-                    if reset_submitted:
-                        if not new_pw or new_pw != new_pw2:
-                            st.warning("Die neuen Passwörter stimmen nicht überein oder sind leer.")
-                        elif len(new_pw) < 4:
-                            st.warning("Das neue Passwort sollte mindestens 4 Zeichen haben.")
-                        else:
-                            verified_uid = verify_security_answers(reset_username.strip(), a1, a2)
-                            if verified_uid:
-                                reset_password(verified_uid, new_pw)
-                                st.success("Passwort wurde zurückgesetzt. Du kannst dich jetzt mit dem neuen Passwort anmelden.")
-                            else:
-                                st.error("Eine oder beide Antworten sind falsch.")
     st.stop()
 
 user_id = st.session_state.user["id"]
@@ -824,7 +801,7 @@ share_html = f"""
   const btn = document.getElementById("share-btn");
   btn.addEventListener("click", async () => {{
     const shareData = {{
-      title: "Bierball League",
+      title: "Bassi Bierball",
       text: {SHARE_TEXT!r},
       url: {APP_URL!r}
     }};
@@ -860,7 +837,7 @@ if st.sidebar.button("Abmelden"):
     st.session_state.user = None
     st.rerun()
 
-st.title("Bierball League")
+st.title("Bassi Bierball")
 
 pending_friend_count = len(get_pending_friend_requests(user_id))
 pending_invite_count = len(get_pending_invites(user_id))
@@ -1147,7 +1124,7 @@ with tabs[4]:
             except Exception:
                 date_display = str(m["Datum"])
             ort_part = f" {m['Ort']}" if m.get("Ort") else ""
-            title = f"{date_display}{ort_part} Bierball League"
+            title = f"{date_display}{ort_part} Bierball"
 
             with st.expander(title):
                 pdf = get_match_participants_view(int(m["id"]))
@@ -1227,6 +1204,28 @@ if is_admin_user:
         st.subheader("Alle registrierten Nutzer")
         users_overview = get_all_users_overview()
         st.dataframe(users_overview, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Passwort-Reset freischalten")
+        st.caption("Schaltet für einen Nutzer einmalig frei, dass er beim nächsten Login-Versuch (nach einer falschen Passworteingabe) sein Passwort selbst neu setzen kann. Die Freischaltung erlischt automatisch, sobald das neue Passwort gesetzt wurde.")
+        users_overview_reset = get_all_users_overview()
+        for _, u_row in users_overview_reset.iterrows():
+            target_uid = int(u_row["id"])
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                reset_status = "🟢 Freigeschaltet" if u_row.get("password_reset_allowed") else "⚪ Nicht freigeschaltet"
+                st.write(f"**{u_row['display_name']}** (@{u_row['username']}) – {reset_status}")
+            with c2:
+                if u_row.get("password_reset_allowed"):
+                    if st.button("Zurücknehmen", key=f"revoke_reset_{target_uid}"):
+                        set_password_reset_allowed(target_uid, False)
+                        st.success(f"Freischaltung für @{u_row['username']} zurückgenommen.")
+                        st.rerun()
+                else:
+                    if st.button("Freischalten", key=f"grant_reset_{target_uid}"):
+                        set_password_reset_allowed(target_uid, True)
+                        st.success(f"Passwort-Reset für @{u_row['username']} freigeschaltet.")
+                        st.rerun()
 
         st.divider()
         st.subheader("Account löschen")
