@@ -4,7 +4,6 @@ import pandas as pd
 import hashlib
 import secrets
 from datetime import date, datetime
-from io import BytesIO
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
@@ -34,7 +33,6 @@ def init_db():
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             display_name TEXT NOT NULL,
-            profile_pic BLOB,
             sq1_id INTEGER,
             sq1_salt TEXT,
             sq1_hash TEXT,
@@ -79,6 +77,7 @@ def init_db():
             winner TEXT,
             status TEXT NOT NULL,
             created_at TEXT,
+            ort TEXT,
             FOREIGN KEY (ruleset_id) REFERENCES rulesets(id),
             FOREIGN KEY (host_id) REFERENCES users(id)
         )
@@ -86,6 +85,8 @@ def init_db():
     existing_match_cols = {row[1] for row in c.execute("PRAGMA table_info(matches)").fetchall()}
     if "created_at" not in existing_match_cols:
         c.execute("ALTER TABLE matches ADD COLUMN created_at TEXT")
+    if "ort" not in existing_match_cols:
+        c.execute("ALTER TABLE matches ADD COLUMN ort TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS match_invites (
@@ -252,19 +253,16 @@ def get_user(user_id):
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT id, username, display_name, profile_pic FROM users WHERE id = ?", (user_id,)
+            "SELECT id, username, display_name FROM users WHERE id = ?", (user_id,)
         ).fetchone()
     finally:
         conn.close()
     return row
 
-def update_profile(user_id, display_name, profile_pic_bytes):
+def update_profile(user_id, display_name):
     conn = get_conn()
     try:
-        if profile_pic_bytes is not None:
-            conn.execute("UPDATE users SET display_name = ?, profile_pic = ? WHERE id = ?", (display_name, profile_pic_bytes, user_id))
-        else:
-            conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
+        conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
         conn.commit()
     finally:
         conn.close()
@@ -322,7 +320,7 @@ def get_friends(user_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT u.id, u.display_name, u.username, u.profile_pic FROM friendships f
+            SELECT u.id, u.display_name, u.username FROM friendships f
             JOIN users u ON u.id = (CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END)
             WHERE (f.user_id = ? OR f.friend_id = ?) AND f.status = 'akzeptiert'
         """, conn, params=(user_id, user_id, user_id))
@@ -353,13 +351,13 @@ def save_custom_ruleset(name, flags):
         conn.close()
     return ok
 
-def create_match(match_date, ruleset_id, host_id, invite_assignments):
+def create_match(match_date, ruleset_id, host_id, invite_assignments, ort=""):
     conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at) VALUES (?,?,?,?,?,?)",
-            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()))
+            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort) VALUES (?,?,?,?,?,?,?)",
+            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort)
         )
         match_id = c.lastrowid
         c.execute(
@@ -416,7 +414,7 @@ def get_open_matches_for_host(host_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date, r.name AS regelwerk, m.status
+            SELECT m.id, m.match_date, r.name AS regelwerk, m.status, m.ort AS ort
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id
             WHERE m.host_id = ? AND m.status = 'einladung_offen'
             ORDER BY m.match_date DESC
@@ -469,7 +467,7 @@ def get_all_matches_feed():
     try:
         df = pd.read_sql("""
             SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner AS Gewinner,
-                   u.display_name AS Host, m.status AS Status
+                   u.display_name AS Host, m.host_id AS HostId, m.status AS Status, m.ort AS Ort
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id JOIN users u ON m.host_id = u.id
             WHERE m.status IN ('einladung_offen', 'abgeschlossen')
             ORDER BY m.match_date DESC, m.id DESC
@@ -563,19 +561,19 @@ def get_match_history_for_player(user_id):
     finally:
         conn.close()
     if not df.empty:
-        df["Netto_Sieg"] = df["Sieg"].apply(lambda x: 1 if x == 1 else -1)
-        df["Punktekonto_Siege"] = df["Netto_Sieg"].cumsum()
-        df["Verfehlt"] = df["Wuerfe"] - df["Treffer"]
-        df["Netto_Treffer"] = df["Treffer"] - df["Verfehlt"]
-        df["Punktekonto_Treffer"] = df["Netto_Treffer"].cumsum()
         df["Spielnummer"] = df.index + 1
+        df["Kum_Siege"] = df["Sieg"].cumsum()
+        df["Siegquote_Verlauf"] = (df["Kum_Siege"] / df["Spielnummer"] * 100).round(1)
+        df["Kum_Treffer"] = df["Treffer"].cumsum()
+        df["Kum_Wuerfe"] = df["Wuerfe"].cumsum()
+        df["Trefferquote_Verlauf"] = (df["Kum_Treffer"] / df["Kum_Wuerfe"].replace(0, pd.NA) * 100).round(1)
     return df
 
 def get_full_match_list_for_user(target_user_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner, u.display_name AS Host
+            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner, u.display_name AS Host, m.ort AS Ort
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN rulesets r ON m.ruleset_id = r.id
@@ -587,49 +585,30 @@ def get_full_match_list_for_user(target_user_id):
         conn.close()
     return df
 
-def render_match_names_colored(participants_df, winner):
-    parts = []
-    for _, row in participants_df.iterrows():
-        color = "#2e8b57" if row["Team"] == winner else "#c0392b"
-        parts.append(f'<span style="color:{color}; font-weight:600; margin-right:14px;">{row["Spieler"]}</span>')
-    st.markdown("".join(parts), unsafe_allow_html=True)
+def render_teams_vs(participants_df):
+    team_a_names = participants_df.loc[participants_df["Team"] == "A", "Spieler"].tolist()
+    team_b_names = participants_df.loc[participants_df["Team"] == "B", "Spieler"].tolist()
+    team_a_str = ", ".join(team_a_names) if team_a_names else "–"
+    team_b_str = ", ".join(team_b_names) if team_b_names else "–"
+    st.markdown(f"**{team_a_str}**  vs  **{team_b_str}**")
 
 def render_running_match_names(participants_df):
-    parts = []
-    for _, row in participants_df.iterrows():
-        parts.append(f'<span style="color:#333; font-weight:500; margin-right:14px;">{row["Spieler"]}</span>')
-    parts.append('<span style="color:#2e8b57; font-weight:700; margin-left:8px;">● Spiel läuft</span>')
-    st.markdown("".join(parts), unsafe_allow_html=True)
+    st.markdown('<span style="color:#2e8b57; font-weight:700;">● Spiel laeuft</span>', unsafe_allow_html=True)
 
 def render_match_stats_table(participants_df, winner):
-    rows_html = ""
-    for _, row in participants_df.iterrows():
-        color = "#2e8b57" if row["Team"] == winner else "#c0392b"
-        treffer = row["Treffer"]
-        wuerfe = row["Wuerfe"]
-        quote = f"{(treffer/wuerfe*100):.1f}%" if wuerfe and wuerfe > 0 else "–"
-        rows_html += f"""
-        <tr>
-            <td style="padding:4px 10px; color:{color}; font-weight:600;">{row['Spieler']}</td>
-            <td style="padding:4px 10px;">{row['Team']}</td>
-            <td style="padding:4px 10px;">{treffer if pd.notna(treffer) else '–'}</td>
-            <td style="padding:4px 10px;">{wuerfe if pd.notna(wuerfe) else '–'}</td>
-            <td style="padding:4px 10px;">{quote}</td>
-        </tr>
-        """
-    table_html = f"""
-    <table style="width:100%; border-collapse:collapse; font-size:14px;">
-        <tr style="border-bottom:1px solid #ddd; text-align:left; color:gray;">
-            <th style="padding:4px 10px;">Spieler</th>
-            <th style="padding:4px 10px;">Team</th>
-            <th style="padding:4px 10px;">Treffer</th>
-            <th style="padding:4px 10px;">Würfe</th>
-            <th style="padding:4px 10px;">Trefferquote</th>
-        </tr>
-        {rows_html}
-    </table>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
+    display_df = participants_df.copy()
+    quotes = []
+    for _, row in display_df.iterrows():
+        w = row["Wuerfe"]
+        t = row["Treffer"]
+        if pd.notna(w) and w and w > 0:
+            quotes.append(f"{(t / w * 100):.1f}%")
+        else:
+            quotes.append("–")
+    display_df["Trefferquote"] = quotes
+    display_df["Ergebnis"] = display_df["Team"].apply(lambda t: "Sieg" if t == winner else "Niederlage")
+    display_df = display_df[["Spieler", "Team", "Ergebnis", "Treffer", "Wuerfe", "Trefferquote"]]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 try:
     init_db()
@@ -790,25 +769,16 @@ tabs = st.tabs(["Profil", freunde_label, "Neues Spiel", einladungen_label, spiel
 with tabs[0]:
     st.header("Mein Profil")
     user_row = get_user(user_id)
-    _, username, current_display_name, current_pic = user_row
+    _, username, current_display_name = user_row
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if current_pic:
-            st.image(BytesIO(current_pic), width=120)
-        else:
-            st.write("Kein Profilbild")
-    with col2:
-        with st.form("profile_form"):
-            new_display_name = st.text_input("Anzeigename", value=current_display_name)
-            new_pic_file = st.file_uploader("Profilbild hochladen", type=["png", "jpg", "jpeg"])
-            profile_submitted = st.form_submit_button("Speichern")
-            if profile_submitted:
-                pic_bytes = new_pic_file.read() if new_pic_file else None
-                update_profile(user_id, new_display_name.strip(), pic_bytes)
-                st.session_state.user["display_name"] = new_display_name.strip()
-                st.success("Profil aktualisiert.")
-                st.rerun()
+    with st.form("profile_form"):
+        new_display_name = st.text_input("Anzeigename", value=current_display_name)
+        profile_submitted = st.form_submit_button("Speichern")
+        if profile_submitted:
+            update_profile(user_id, new_display_name.strip())
+            st.session_state.user["display_name"] = new_display_name.strip()
+            st.success("Profil aktualisiert.")
+            st.rerun()
 
     st.divider()
     st.subheader("Meine Statistiken")
@@ -873,13 +843,10 @@ with tabs[1]:
             st.session_state.selected_friend_id = None
 
         for _, fr in friends_df.iterrows():
-            c1, c2, c3 = st.columns([1, 3, 1])
+            c1, c2 = st.columns([3, 1])
             with c1:
-                if fr["profile_pic"]:
-                    st.image(BytesIO(fr["profile_pic"]), width=50)
-            with c2:
                 st.write(f"**{fr['display_name']}** (@{fr['username']})")
-            with c3:
+            with c2:
                 if st.button("Profil ansehen", key=f"view_friend_{fr['id']}"):
                     st.session_state.selected_friend_id = int(fr["id"])
                     st.rerun()
@@ -912,7 +879,7 @@ with tabs[1]:
                     for _, fm in friend_matches.iterrows():
                         with st.expander(f"{fm['Datum']} – {fm['Regelwerk']} (Host: {fm['Host']})"):
                             pdf = get_match_participants_view(int(fm["id"]))
-                            render_match_names_colored(pdf, fm["winner"])
+                            render_teams_vs(pdf)
                             st.markdown("<br>", unsafe_allow_html=True)
                             render_match_stats_table(pdf, fm["winner"])
 
@@ -925,10 +892,12 @@ with tabs[2]:
     if friends_df.empty:
         st.info("Du brauchst mindestens einen Freund, um ein Spiel zu starten. Füge zuerst Freunde im Tab 'Freunde' hinzu.")
     else:
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             match_date = st.date_input("Datum", value=date.today())
         with col2:
+            match_ort = st.text_input("Ort", placeholder="z.B. Bassinplatz")
+        with col3:
             ruleset_names = rulesets_df["name"].tolist() + ["Individuell (neu definieren)"]
             chosen_ruleset_name = st.selectbox("Regelwerk", ruleset_names)
 
@@ -978,19 +947,22 @@ with tabs[2]:
                 for name in team_b_friends:
                     uid = int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0])
                     invite_assignments[uid] = "B"
-                create_match(match_date, ruleset_id, user_id, invite_assignments)
+                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip())
                 st.success("Spiel erstellt und Einladungen versendet!")
                 st.rerun()
 
     st.divider()
-    st.subheader("Meine offenen Spiele (warte auf Zusagen)")
     open_matches = get_open_matches_for_host(user_id)
     if open_matches.empty:
+        st.subheader("Meine offenen Spiele")
         st.caption("Keine offenen Spiele.")
     else:
         for _, m in open_matches.iterrows():
-            with st.expander(f"Spiel {m['id']} – {m['match_date']} ({m['regelwerk']})"):
-                invite_status = get_match_invite_status(int(m["id"]))
+            invite_status = get_match_invite_status(int(m["id"]))
+            all_accepted = invite_status.empty or (invite_status["Status"] == "angenommen").all()
+            status_label = "bereit" if all_accepted else "warte auf Zusagen"
+            ort_display = f" – {m['ort']}" if m.get("ort") else ""
+            with st.expander(f"Spiel {m['id']} – {m['match_date']}{ort_display} ({m['regelwerk']}) ({status_label})"):
                 st.dataframe(invite_status, use_container_width=True, hide_index=True)
 
                 participants = get_match_participants_for_completion(int(m["id"]))
@@ -1000,14 +972,12 @@ with tabs[2]:
 
                 stats_inputs = {}
                 for _, p in participants.iterrows():
-                    c1, c2, c3 = st.columns(3)
+                    c1, c2 = st.columns(2)
                     with c1:
                         treffer = st.number_input(f"Treffer – {p['Spieler']} (Team {p['Team']})", min_value=0, step=1, key=f"tr_{m['id']}_{p['id']}")
                     with c2:
                         wuerfe = st.number_input(f"Würfe – {p['Spieler']}", min_value=0, step=1, key=f"wu_{m['id']}_{p['id']}")
-                    with c3:
-                        platz = st.number_input(f"Individuelle Platzierung – {p['Spieler']}", min_value=1, step=1, key=f"pl_{m['id']}_{p['id']}")
-                    stats_inputs[int(p["id"])] = {"treffer": treffer, "wuerfe": wuerfe, "platzierung": platz}
+                    stats_inputs[int(p["id"])] = {"treffer": treffer, "wuerfe": wuerfe, "platzierung": None}
 
                 if st.button("Spiel abschließen", key=f"finalize_{m['id']}"):
                     finalize_match(int(m["id"]), winner_code, stats_inputs)
@@ -1046,22 +1016,24 @@ with tabs[4]:
         st.info("Noch keine Spiele vorhanden.")
     else:
         for _, m in all_matches_feed.iterrows():
-            with st.expander(f"{m['Datum']} – {m['Regelwerk']} (Host: {m['Host']})"):
+            try:
+                date_display = datetime.strptime(str(m["Datum"]), "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                date_display = str(m["Datum"])
+            ort_part = f" {m['Ort']}" if m.get("Ort") else ""
+            title = f"{date_display}{ort_part} Bierball League"
+
+            with st.expander(title):
                 pdf = get_match_participants_view(int(m["id"]))
+                render_teams_vs(pdf)
                 if m["Status"] == "einladung_offen":
                     render_running_match_names(pdf)
                 else:
-                    render_match_names_colored(pdf, m["Gewinner"])
                     st.markdown("<br>", unsafe_allow_html=True)
                     render_match_stats_table(pdf, m["Gewinner"])
 
-                is_participant = user_id in get_match_participants_for_completion(int(m["id"]))["user_id"].values
-                is_host = False
-                open_match_row = get_open_matches_for_host(user_id)
-                if not open_match_row.empty and int(m["id"]) in open_match_row["id"].values:
-                    is_host = True
-
-                if is_host or is_participant:
+                is_host = (int(m["HostId"]) == user_id)
+                if is_host:
                     if st.button("Dieses Spiel löschen", key=f"del_hist_{m['id']}"):
                         delete_match(int(m["id"]))
                         st.success("Spiel gelöscht.")
@@ -1092,27 +1064,25 @@ with tabs[5]:
 
         st.divider()
         st.subheader(f"Entwicklung über die Zeit – {selected_name}")
-        st.caption("Bei jedem Sieg bzw. Treffer bewegt sich die Linie einen Schritt nach oben, bei jeder Niederlage bzw. Fehlwurf einen Schritt nach unten. Ein ausgeglichener Spieler bleibt nahe der Null-Linie.")
+        st.caption("Verlauf der Siegquote und Trefferquote (kumuliert in %) über die gespielten Spiele.")
         history_df = get_match_history_for_player(selected_uid)
         if history_df.empty or len(history_df) < 2:
             st.caption("Noch nicht genug abgeschlossene Spiele für eine Zeitverlaufs-Grafik (mindestens 2 nötig).")
         else:
-            fig_siege = go.Figure()
-            fig_siege.add_trace(go.Scatter(
-                x=history_df["Spielnummer"], y=history_df["Punktekonto_Siege"],
-                mode="lines+markers", line=dict(color="#2e8b57"), name="Punktekonto Siege"
+            fig_sieg = go.Figure()
+            fig_sieg.add_trace(go.Scatter(
+                x=history_df["Spielnummer"], y=history_df["Siegquote_Verlauf"],
+                mode="lines+markers", line=dict(color="#2e8b57"), name="Siegquote (%)"
             ))
-            fig_siege.add_hline(y=0, line_dash="dash", line_color="gray")
-            fig_siege.update_layout(title="Sieg/Niederlage-Verlauf (Zufallsweg)", xaxis_title="Spielnummer", yaxis_title="Punktekonto")
-            st.plotly_chart(fig_siege, use_container_width=True)
+            fig_sieg.update_layout(title="Siegquote im Verlauf", xaxis_title="Spielnummer", yaxis_title="Siegquote (%)", yaxis_range=[0, 100])
+            st.plotly_chart(fig_sieg, use_container_width=True)
 
             fig_treffer = go.Figure()
             fig_treffer.add_trace(go.Scatter(
-                x=history_df["Spielnummer"], y=history_df["Punktekonto_Treffer"],
-                mode="lines+markers", line=dict(color="#2980b9"), name="Punktekonto Treffer"
+                x=history_df["Spielnummer"], y=history_df["Trefferquote_Verlauf"],
+                mode="lines+markers", line=dict(color="#2980b9"), name="Trefferquote (%)"
             ))
-            fig_treffer.add_hline(y=0, line_dash="dash", line_color="gray")
-            fig_treffer.update_layout(title="Treffer/Fehlwurf-Verlauf (Zufallsweg)", xaxis_title="Spielnummer", yaxis_title="Punktekonto")
+            fig_treffer.update_layout(title="Trefferquote im Verlauf", xaxis_title="Spielnummer", yaxis_title="Trefferquote (%)", yaxis_range=[0, 100])
             st.plotly_chart(fig_treffer, use_container_width=True)
 
 st.session_state.last_seen_matches_total = current_matches_total
