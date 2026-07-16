@@ -1,11 +1,12 @@
-
 import streamlit as st
 import sqlite3
 import pandas as pd
 import hashlib
 import secrets
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
+import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
 
 DB_PATH = "bierball_v2.db"
 
@@ -82,6 +83,15 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS remember_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
     conn.commit()
 
     c.execute("SELECT COUNT(*) FROM rulesets")
@@ -122,6 +132,34 @@ def verify_login(username, password):
     if hash_password(password, salt) == ph:
         return {"id": user_id, "display_name": display_name, "username": username}
     return None
+
+def create_remember_token(user_id):
+    conn = get_conn()
+    token = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO remember_tokens (user_id, token, created_at) VALUES (?,?,?)",
+        (user_id, token, str(datetime.now()))
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+def verify_remember_token(token):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT u.id, u.username, u.display_name FROM remember_tokens rt JOIN users u ON rt.user_id = u.id WHERE rt.token = ?",
+        (token,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {"id": row[0], "username": row[1], "display_name": row[2]}
+
+def delete_remember_token(token):
+    conn = get_conn()
+    conn.execute("DELETE FROM remember_tokens WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
 
 def get_user(user_id):
     conn = get_conn()
@@ -362,6 +400,24 @@ def get_player_stats_for_friends(user_id):
         df["Siegquote"] = (df["Siege"] / df["Spiele"]).round(3)
     return df
 
+def get_match_history_for_player(user_id):
+    conn = get_conn()
+    df = pd.read_sql('''
+        SELECT m.match_date AS Datum, m.id AS match_id,
+               mp.treffer AS Treffer, mp.wuerfe AS Wuerfe, mp.platzierung AS Platzierung,
+               CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END AS Sieg
+        FROM match_participants mp
+        JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
+        WHERE mp.user_id = ?
+        ORDER BY m.match_date ASC, m.id ASC
+    ''', conn, params=(user_id,))
+    conn.close()
+    if not df.empty:
+        df["Trefferquote"] = (df["Treffer"] / df["Wuerfe"].replace(0, pd.NA)).round(3)
+        df["Kumulierte Siegquote"] = (df["Sieg"].cumsum() / (df.index + 1)).round(3)
+        df["Spielnummer"] = df.index + 1
+    return df
+
 try:
     init_db()
 except Exception as e:
@@ -373,6 +429,13 @@ st.set_page_config(page_title="Bierball League", layout="wide")
 if "user" not in st.session_state:
     st.session_state.user = None
 
+query_params = st.query_params
+if st.session_state.user is None and "remember_token" in query_params:
+    token_from_url = query_params["remember_token"]
+    remembered_user = verify_remember_token(token_from_url)
+    if remembered_user:
+        st.session_state.user = remembered_user
+
 if st.session_state.user is None:
     st.title("Bierball League – Login")
     login_tab, register_tab = st.tabs(["Anmelden", "Registrieren"])
@@ -381,11 +444,15 @@ if st.session_state.user is None:
         with st.form("login_form"):
             u = st.text_input("Benutzername")
             p = st.text_input("Passwort", type="password")
+            remember_me = st.checkbox("Angemeldet bleiben", value=True)
             submitted = st.form_submit_button("Anmelden")
             if submitted:
                 result = verify_login(u.strip(), p)
                 if result:
                     st.session_state.user = result
+                    if remember_me:
+                        token = create_remember_token(result["id"])
+                        st.query_params["remember_token"] = token
                     st.rerun()
                 else:
                     st.error("Benutzername oder Passwort falsch.")
@@ -408,8 +475,13 @@ if st.session_state.user is None:
 user_id = st.session_state.user["id"]
 display_name = st.session_state.user["display_name"]
 
+st_autorefresh(interval=15000, key="live_refresh")
+
 st.sidebar.write(f"Angemeldet als **{display_name}**")
 if st.sidebar.button("Abmelden"):
+    if "remember_token" in st.query_params:
+        delete_remember_token(st.query_params["remember_token"])
+        del st.query_params["remember_token"]
     st.session_state.user = None
     st.rerun()
 
@@ -538,6 +610,12 @@ with tabs[2]:
                         st.warning("Ein Regelwerk mit diesem Namen existiert bereits.")
         else:
             ruleset_id = int(rulesets_df.loc[rulesets_df["name"] == chosen_ruleset_name, "id"].iloc[0])
+            rrow = rulesets_df.loc[rulesets_df["id"] == ruleset_id].iloc[0]
+            st.caption(
+                f"Tropfen erlaubt: {'Ja' if rrow.tropfen_erlaubt else 'Nein'}  \n"
+                f"Von oben werfen Pflicht: {'Ja' if rrow.wurf_von_oben else 'Nein'}  \n"
+                f"3-Sekunden-Regel: {'Ja' if rrow.drei_sekunden_regel else 'Nein'}"
+            )
 
         st.divider()
         st.subheader("Team A")
@@ -646,4 +724,40 @@ with tabs[5]:
     if stats_df.empty:
         st.info("Noch keine Statistiken vorhanden.")
     else:
-        st.dataframe(stats_df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+        ranked_df = stats_df.sort_values(by="Siegquote", ascending=False).reset_index(drop=True)
+        ranked_df.insert(0, "Rang", ranked_df.index + 1)
+        display_ranked = ranked_df.drop(columns=["id"]).copy()
+        display_ranked["Siegquote"] = (display_ranked["Siegquote"] * 100).round(1).astype(str) + " %"
+        st.dataframe(display_ranked, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Individuelle Statistiken ansehen")
+        selected_name = st.selectbox("Spieler auswählen", ranked_df["Spieler"].tolist(), key="rangliste_player_select")
+        srow = ranked_df.loc[ranked_df["Spieler"] == selected_name].iloc[0]
+        selected_uid = int(srow["id"])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Spiele", int(srow["Spiele"]))
+        c2.metric("Siegquote", f"{srow['Siegquote']*100:.1f}%")
+        c3.metric("Trefferquote", f"{srow['Trefferquote']*100:.1f}%" if pd.notna(srow["Trefferquote"]) else "–")
+        c4.metric("Ø Individuelle Platzierung", srow["Ø Individuelle Platzierung"])
+
+        st.divider()
+        st.subheader(f"Entwicklung über die Zeit – {selected_name}")
+        history_df = get_match_history_for_player(selected_uid)
+        if history_df.empty or len(history_df) < 2:
+            st.caption("Noch nicht genug abgeschlossene Spiele für eine Zeitverlaufs-Grafik (mindestens 2 nötig).")
+        else:
+            fig_siegquote = px.line(history_df, x="Spielnummer", y="Kumulierte Siegquote", markers=True,
+                                     title="Kumulierte Siegquote im Verlauf")
+            fig_siegquote.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig_siegquote, use_container_width=True)
+
+            fig_trefferquote = px.line(history_df, x="Spielnummer", y="Trefferquote", markers=True,
+                                        title="Trefferquote pro Spiel")
+            fig_trefferquote.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig_trefferquote, use_container_width=True)
+
+            fig_platzierung = px.line(history_df, x="Spielnummer", y="Platzierung", markers=True,
+                                       title="Individuelle Platzierung pro Spiel")
+            fig_platzierung.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_platzierung, use_container_width=True)
