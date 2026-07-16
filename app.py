@@ -1,13 +1,15 @@
 import streamlit as st
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import pandas as pd
 import hashlib
 import secrets
+import os
 from datetime import date, datetime
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-DB_PATH = "bierball_v2.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 SECURITY_QUESTIONS = {
     1: "Wie hieß dein erstes Haustier?",
@@ -18,17 +20,16 @@ SECURITY_QUESTIONS = {
 }
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ist nicht gesetzt. Bitte als Umgebungsvariable in Render hinterlegen.")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
@@ -41,17 +42,9 @@ def init_db():
             sq2_hash TEXT
         )
     """)
-    existing_cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
-    for col_name, col_type in [
-        ("sq1_id", "INTEGER"), ("sq1_salt", "TEXT"), ("sq1_hash", "TEXT"),
-        ("sq2_id", "INTEGER"), ("sq2_salt", "TEXT"), ("sq2_hash", "TEXT")
-    ]:
-        if col_name not in existing_cols:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
-
     c.execute("""
         CREATE TABLE IF NOT EXISTS friendships (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL,
             friend_id INTEGER NOT NULL,
             status TEXT NOT NULL,
@@ -61,7 +54,7 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS rulesets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
             tropfen_erlaubt INTEGER NOT NULL,
             wurf_von_oben INTEGER NOT NULL,
@@ -70,55 +63,45 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             match_date TEXT NOT NULL,
-            ruleset_id INTEGER NOT NULL,
-            host_id INTEGER NOT NULL,
+            ruleset_id INTEGER NOT NULL REFERENCES rulesets(id),
+            host_id INTEGER NOT NULL REFERENCES users(id),
             winner TEXT,
             status TEXT NOT NULL,
             created_at TEXT,
-            ort TEXT,
-            FOREIGN KEY (ruleset_id) REFERENCES rulesets(id),
-            FOREIGN KEY (host_id) REFERENCES users(id)
+            ort TEXT
         )
     """)
-    existing_match_cols = {row[1] for row in c.execute("PRAGMA table_info(matches)").fetchall()}
-    if "created_at" not in existing_match_cols:
-        c.execute("ALTER TABLE matches ADD COLUMN created_at TEXT")
-    if "ort" not in existing_match_cols:
-        c.execute("ALTER TABLE matches ADD COLUMN ort TEXT")
+    c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TEXT")
+    c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS ort TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS match_invites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            match_id INTEGER NOT NULL REFERENCES matches(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
             team TEXT NOT NULL,
-            status TEXT NOT NULL,
-            FOREIGN KEY (match_id) REFERENCES matches(id),
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            status TEXT NOT NULL
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS match_participants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            match_id INTEGER NOT NULL REFERENCES matches(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
             team TEXT NOT NULL,
             treffer INTEGER,
             wuerfe INTEGER,
-            platzierung INTEGER,
-            FOREIGN KEY (match_id) REFERENCES matches(id),
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            platzierung INTEGER
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS remember_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
             token TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            created_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -126,7 +109,7 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM rulesets")
     if c.fetchone()[0] == 0:
         c.executemany(
-            "INSERT INTO rulesets (name, tropfen_erlaubt, wurf_von_oben, drei_sekunden_regel) VALUES (?,?,?,?)",
+            "INSERT INTO rulesets (name, tropfen_erlaubt, wurf_von_oben, drei_sekunden_regel) VALUES (%s,%s,%s,%s)",
             [("Bassi-Regeln", 0, 0, 1), ("Studentenregeln", 1, 1, 0)]
         )
         conn.commit()
@@ -148,14 +131,16 @@ def create_user(username, password, display_name, sq1_id, sq1_answer, sq2_id, sq
     sq2_hash = hash_text(sq2_answer, sq2_salt)
     ok = True
     try:
-        conn.execute(
+        c = conn.cursor()
+        c.execute(
             """INSERT INTO users
                (username, password_hash, salt, display_name, sq1_id, sq1_salt, sq1_hash, sq2_id, sq2_salt, sq2_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (username, ph, salt, display_name, sq1_id, sq1_salt, sq1_hash, sq2_id, sq2_salt, sq2_hash)
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         ok = False
     finally:
         conn.close()
@@ -164,10 +149,12 @@ def create_user(username, password, display_name, sq1_id, sq1_answer, sq2_id, sq
 def verify_login(username, password):
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, password_hash, salt, display_name FROM users WHERE username = ?",
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, password_hash, salt, display_name FROM users WHERE username = %s",
             (username,)
-        ).fetchone()
+        )
+        row = c.fetchone()
     finally:
         conn.close()
     if row is None:
@@ -180,9 +167,9 @@ def verify_login(username, password):
 def get_security_questions_for_user(username):
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, sq1_id, sq2_id FROM users WHERE username = ?", (username,)
-        ).fetchone()
+        c = conn.cursor()
+        c.execute("SELECT id, sq1_id, sq2_id FROM users WHERE username = %s", (username,))
+        row = c.fetchone()
     finally:
         conn.close()
     return row
@@ -190,10 +177,12 @@ def get_security_questions_for_user(username):
 def verify_security_answers(username, answer1, answer2):
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, sq1_salt, sq1_hash, sq2_salt, sq2_hash FROM users WHERE username = ?",
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, sq1_salt, sq1_hash, sq2_salt, sq2_hash FROM users WHERE username = %s",
             (username,)
-        ).fetchone()
+        )
+        row = c.fetchone()
     finally:
         conn.close()
     if row is None:
@@ -208,9 +197,10 @@ def verify_security_answers(username, answer1, answer2):
 def reset_password(user_id, new_password):
     conn = get_conn()
     try:
+        c = conn.cursor()
         new_salt = secrets.token_hex(8)
         new_hash = hash_password(new_password, new_salt)
-        conn.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (new_hash, new_salt, user_id))
+        c.execute("UPDATE users SET password_hash = %s, salt = %s WHERE id = %s", (new_hash, new_salt, user_id))
         conn.commit()
     finally:
         conn.close()
@@ -218,9 +208,10 @@ def reset_password(user_id, new_password):
 def create_remember_token(user_id):
     conn = get_conn()
     try:
+        c = conn.cursor()
         token = secrets.token_hex(32)
-        conn.execute(
-            "INSERT INTO remember_tokens (user_id, token, created_at) VALUES (?,?,?)",
+        c.execute(
+            "INSERT INTO remember_tokens (user_id, token, created_at) VALUES (%s,%s,%s)",
             (user_id, token, str(datetime.now()))
         )
         conn.commit()
@@ -231,10 +222,12 @@ def create_remember_token(user_id):
 def verify_remember_token(token):
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT u.id, u.username, u.display_name FROM remember_tokens rt JOIN users u ON rt.user_id = u.id WHERE rt.token = ?",
+        c = conn.cursor()
+        c.execute(
+            "SELECT u.id, u.username, u.display_name FROM remember_tokens rt JOIN users u ON rt.user_id = u.id WHERE rt.token = %s",
             (token,)
-        ).fetchone()
+        )
+        row = c.fetchone()
     finally:
         conn.close()
     if row is None:
@@ -244,7 +237,8 @@ def verify_remember_token(token):
 def delete_remember_token(token):
     conn = get_conn()
     try:
-        conn.execute("DELETE FROM remember_tokens WHERE token = ?", (token,))
+        c = conn.cursor()
+        c.execute("DELETE FROM remember_tokens WHERE token = %s", (token,))
         conn.commit()
     finally:
         conn.close()
@@ -252,9 +246,9 @@ def delete_remember_token(token):
 def get_user(user_id):
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, username, display_name FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
+        c = conn.cursor()
+        c.execute("SELECT id, username, display_name FROM users WHERE id = %s", (user_id,))
+        row = c.fetchone()
     finally:
         conn.close()
     return row
@@ -262,7 +256,8 @@ def get_user(user_id):
 def update_profile(user_id, display_name):
     conn = get_conn()
     try:
-        conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
+        c = conn.cursor()
+        c.execute("UPDATE users SET display_name = %s WHERE id = %s", (display_name, user_id))
         conn.commit()
     finally:
         conn.close()
@@ -271,7 +266,7 @@ def search_users(query, exclude_id):
     conn = get_conn()
     try:
         df = pd.read_sql(
-            "SELECT id, username, display_name FROM users WHERE (username LIKE ? OR display_name LIKE ?) AND id != ?",
+            "SELECT id, username, display_name FROM users WHERE (username ILIKE %s OR display_name ILIKE %s) AND id != %s",
             conn, params=(f"%{query}%", f"%{query}%", exclude_id)
         )
     finally:
@@ -282,12 +277,14 @@ def send_friend_request(user_id, friend_id):
     conn = get_conn()
     ok = True
     try:
-        conn.execute(
-            "INSERT INTO friendships (user_id, friend_id, status, requested_by) VALUES (?,?,?,?)",
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO friendships (user_id, friend_id, status, requested_by) VALUES (%s,%s,%s,%s)",
             (user_id, friend_id, "ausstehend", user_id)
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         ok = False
     finally:
         conn.close()
@@ -296,10 +293,11 @@ def send_friend_request(user_id, friend_id):
 def respond_friend_request(request_id, accept):
     conn = get_conn()
     try:
+        c = conn.cursor()
         if accept:
-            conn.execute("UPDATE friendships SET status = 'akzeptiert' WHERE id = ?", (request_id,))
+            c.execute("UPDATE friendships SET status = 'akzeptiert' WHERE id = %s", (request_id,))
         else:
-            conn.execute("DELETE FROM friendships WHERE id = ?", (request_id,))
+            c.execute("DELETE FROM friendships WHERE id = %s", (request_id,))
         conn.commit()
     finally:
         conn.close()
@@ -310,7 +308,7 @@ def get_pending_friend_requests(user_id):
         df = pd.read_sql("""
             SELECT f.id, u.id AS requester_id, u.display_name, u.username
             FROM friendships f JOIN users u ON f.requested_by = u.id
-            WHERE f.friend_id = ? AND f.status = 'ausstehend' AND f.requested_by != ?
+            WHERE f.friend_id = %s AND f.status = 'ausstehend' AND f.requested_by != %s
         """, conn, params=(user_id, user_id))
     finally:
         conn.close()
@@ -321,8 +319,8 @@ def get_friends(user_id):
     try:
         df = pd.read_sql("""
             SELECT u.id, u.display_name, u.username FROM friendships f
-            JOIN users u ON u.id = (CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END)
-            WHERE (f.user_id = ? OR f.friend_id = ?) AND f.status = 'akzeptiert'
+            JOIN users u ON u.id = (CASE WHEN f.user_id = %s THEN f.friend_id ELSE f.user_id END)
+            WHERE (f.user_id = %s OR f.friend_id = %s) AND f.status = 'akzeptiert'
         """, conn, params=(user_id, user_id, user_id))
     finally:
         conn.close()
@@ -340,12 +338,14 @@ def save_custom_ruleset(name, flags):
     conn = get_conn()
     ok = True
     try:
-        conn.execute(
-            "INSERT INTO rulesets (name, tropfen_erlaubt, wurf_von_oben, drei_sekunden_regel) VALUES (?,?,?,?)",
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO rulesets (name, tropfen_erlaubt, wurf_von_oben, drei_sekunden_regel) VALUES (%s,%s,%s,%s)",
             (name, *flags)
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         ok = False
     finally:
         conn.close()
@@ -356,19 +356,19 @@ def create_match(match_date, ruleset_id, host_id, invite_assignments, ort=""):
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort)
         )
-        match_id = c.lastrowid
+        match_id = c.fetchone()[0]
         c.execute(
-            "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (%s,%s,%s,%s,%s,%s)",
             (match_id, host_id, invite_assignments[host_id], None, None, None)
         )
         for uid, team in invite_assignments.items():
             if uid == host_id:
                 continue
             c.execute(
-                "INSERT INTO match_invites (match_id, user_id, team, status) VALUES (?,?,?,?)",
+                "INSERT INTO match_invites (match_id, user_id, team, status) VALUES (%s,%s,%s,%s)",
                 (match_id, uid, team, "ausstehend")
             )
         conn.commit()
@@ -386,7 +386,7 @@ def get_pending_invites(user_id):
             JOIN matches m ON mi.match_id = m.id
             JOIN rulesets r ON m.ruleset_id = r.id
             JOIN users u ON m.host_id = u.id
-            WHERE mi.user_id = ? AND mi.status = 'ausstehend'
+            WHERE mi.user_id = %s AND mi.status = 'ausstehend'
         """, conn, params=(user_id,))
     finally:
         conn.close()
@@ -395,17 +395,19 @@ def get_pending_invites(user_id):
 def respond_invite(invite_id, accept):
     conn = get_conn()
     try:
-        row = conn.execute("SELECT match_id, user_id, team FROM match_invites WHERE id = ?", (invite_id,)).fetchone()
+        c = conn.cursor()
+        c.execute("SELECT match_id, user_id, team FROM match_invites WHERE id = %s", (invite_id,))
+        row = c.fetchone()
         if row:
             match_id, user_id, team = row
             if accept:
-                conn.execute(
-                    "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (?,?,?,?,?,?)",
+                c.execute(
+                    "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (%s,%s,%s,%s,%s,%s)",
                     (match_id, user_id, team, None, None, None)
                 )
-                conn.execute("UPDATE match_invites SET status = 'angenommen' WHERE id = ?", (invite_id,))
+                c.execute("UPDATE match_invites SET status = 'angenommen' WHERE id = %s", (invite_id,))
             else:
-                conn.execute("UPDATE match_invites SET status = 'abgelehnt' WHERE id = ?", (invite_id,))
+                c.execute("UPDATE match_invites SET status = 'abgelehnt' WHERE id = %s", (invite_id,))
             conn.commit()
     finally:
         conn.close()
@@ -416,7 +418,7 @@ def get_open_matches_for_host(host_id):
         df = pd.read_sql("""
             SELECT m.id, m.match_date, r.name AS regelwerk, m.status, m.ort AS ort
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id
-            WHERE m.host_id = ? AND m.status = 'einladung_offen'
+            WHERE m.host_id = %s AND m.status = 'einladung_offen'
             ORDER BY m.match_date DESC
         """, conn, params=(host_id,))
     finally:
@@ -429,7 +431,7 @@ def get_match_invite_status(match_id):
         df = pd.read_sql("""
             SELECT u.display_name AS Spieler, mi.team AS Team, mi.status AS Status
             FROM match_invites mi JOIN users u ON mi.user_id = u.id
-            WHERE mi.match_id = ?
+            WHERE mi.match_id = %s
         """, conn, params=(match_id,))
     finally:
         conn.close()
@@ -441,7 +443,7 @@ def get_match_participants_for_completion(match_id):
         df = pd.read_sql("""
             SELECT mp.id, u.id AS user_id, u.display_name AS Spieler, mp.team AS Team
             FROM match_participants mp JOIN users u ON mp.user_id = u.id
-            WHERE mp.match_id = ?
+            WHERE mp.match_id = %s
             ORDER BY mp.team, u.display_name
         """, conn, params=(match_id,))
     finally:
@@ -452,10 +454,10 @@ def finalize_match(match_id, winner, stats_by_participant_id):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("UPDATE matches SET winner = ?, status = 'abgeschlossen' WHERE id = ?", (winner, match_id))
+        c.execute("UPDATE matches SET winner = %s, status = 'abgeschlossen' WHERE id = %s", (winner, match_id))
         for pid, stats in stats_by_participant_id.items():
             c.execute(
-                "UPDATE match_participants SET treffer = ?, wuerfe = ?, platzierung = ? WHERE id = ?",
+                "UPDATE match_participants SET treffer = %s, wuerfe = %s, platzierung = %s WHERE id = %s",
                 (stats["treffer"], stats["wuerfe"], stats["platzierung"], pid)
             )
         conn.commit()
@@ -466,8 +468,8 @@ def get_all_matches_feed():
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner AS Gewinner,
-                   u.display_name AS Host, m.host_id AS HostId, m.status AS Status, m.ort AS Ort
+            SELECT m.id, m.match_date AS "Datum", r.name AS "Regelwerk", m.winner AS "Gewinner",
+                   u.display_name AS "Host", m.host_id AS "HostId", m.status AS "Status", m.ort AS "Ort"
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id JOIN users u ON m.host_id = u.id
             WHERE m.status IN ('einladung_offen', 'abgeschlossen')
             ORDER BY m.match_date DESC, m.id DESC
@@ -480,9 +482,9 @@ def get_match_participants_view(match_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT mp.team AS Team, u.display_name AS Spieler, mp.treffer AS Treffer, mp.wuerfe AS Wuerfe
+            SELECT mp.team AS "Team", u.display_name AS "Spieler", mp.treffer AS "Treffer", mp.wuerfe AS "Wuerfe"
             FROM match_participants mp JOIN users u ON mp.user_id = u.id
-            WHERE mp.match_id = ?
+            WHERE mp.match_id = %s
             ORDER BY mp.team, u.display_name
         """, conn, params=(match_id,))
     finally:
@@ -492,9 +494,10 @@ def get_match_participants_view(match_id):
 def delete_match(match_id):
     conn = get_conn()
     try:
-        conn.execute("DELETE FROM match_participants WHERE match_id = ?", (match_id,))
-        conn.execute("DELETE FROM match_invites WHERE match_id = ?", (match_id,))
-        conn.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+        c = conn.cursor()
+        c.execute("DELETE FROM match_participants WHERE match_id = %s", (match_id,))
+        c.execute("DELETE FROM match_invites WHERE match_id = %s", (match_id,))
+        c.execute("DELETE FROM matches WHERE id = %s", (match_id,))
         conn.commit()
     finally:
         conn.close()
@@ -503,21 +506,20 @@ def get_player_stats_for_friends(user_id):
     friend_ids = get_friends(user_id)["id"].tolist() + [user_id]
     conn = get_conn()
     try:
-        placeholders = ",".join("?" * len(friend_ids))
-        df = pd.read_sql(f"""
-            SELECT u.id, u.display_name AS Spieler,
-                   COUNT(mp.id) AS Spiele,
-                   SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS Siege,
+        df = pd.read_sql("""
+            SELECT u.id, u.display_name AS "Spieler",
+                   COUNT(mp.id) AS "Spiele",
+                   SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
-            WHERE u.id IN ({placeholders})
+            WHERE u.id = ANY(%s)
             GROUP BY u.id, u.display_name
-            ORDER BY Siege DESC, Trefferquote DESC
-        """, conn, params=friend_ids)
+            ORDER BY "Siege" DESC, "Trefferquote" DESC
+        """, conn, params=(friend_ids,))
     finally:
         conn.close()
     if not df.empty:
@@ -528,16 +530,16 @@ def get_stats_for_single_user(target_user_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT u.id, u.display_name AS Spieler,
-                   COUNT(mp.id) AS Spiele,
-                   SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS Siege,
+            SELECT u.id, u.display_name AS "Spieler",
+                   COUNT(mp.id) AS "Spiele",
+                   SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
-            WHERE u.id = ?
+            WHERE u.id = %s
             GROUP BY u.id, u.display_name
         """, conn, params=(target_user_id,))
     finally:
@@ -550,12 +552,12 @@ def get_match_history_for_player(user_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.match_date AS Datum, m.id AS match_id,
-                   mp.treffer AS Treffer, mp.wuerfe AS Wuerfe,
-                   CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END AS Sieg
+            SELECT m.match_date AS "Datum", m.id AS "match_id",
+                   mp.treffer AS "Treffer", mp.wuerfe AS "Wuerfe",
+                   CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END AS "Sieg"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
-            WHERE mp.user_id = ?
+            WHERE mp.user_id = %s
             ORDER BY m.match_date ASC, m.id ASC
         """, conn, params=(user_id,))
     finally:
@@ -573,12 +575,12 @@ def get_full_match_list_for_user(target_user_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner, u.display_name AS Host, m.ort AS Ort
+            SELECT m.id, m.match_date AS "Datum", r.name AS "Regelwerk", m.winner, u.display_name AS "Host", m.ort AS "Ort"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN rulesets r ON m.ruleset_id = r.id
             JOIN users u ON m.host_id = u.id
-            WHERE mp.user_id = ?
+            WHERE mp.user_id = %s
             ORDER BY m.match_date DESC, m.id DESC
         """, conn, params=(target_user_id,))
     finally:
@@ -1086,4 +1088,3 @@ with tabs[5]:
             st.plotly_chart(fig_treffer, use_container_width=True)
 
 st.session_state.last_seen_matches_total = current_matches_total
-
