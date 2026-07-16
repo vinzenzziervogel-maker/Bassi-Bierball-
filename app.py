@@ -3,10 +3,9 @@ import sqlite3
 import pandas as pd
 import hashlib
 import secrets
-import base64
 from datetime import date, datetime
 from io import BytesIO
-import plotly.express as px
+import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
 DB_PATH = "bierball_v2.db"
@@ -45,12 +44,12 @@ def init_db():
         )
     """)
     existing_cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
-    for col_def in [
+    for col_name, col_type in [
         ("sq1_id", "INTEGER"), ("sq1_salt", "TEXT"), ("sq1_hash", "TEXT"),
         ("sq2_id", "INTEGER"), ("sq2_salt", "TEXT"), ("sq2_hash", "TEXT")
     ]:
-        if col_def[0] not in existing_cols:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col_def[0]} {col_def[1]}")
+        if col_name not in existing_cols:
+            c.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS friendships (
@@ -79,10 +78,15 @@ def init_db():
             host_id INTEGER NOT NULL,
             winner TEXT,
             status TEXT NOT NULL,
+            created_at TEXT,
             FOREIGN KEY (ruleset_id) REFERENCES rulesets(id),
             FOREIGN KEY (host_id) REFERENCES users(id)
         )
     """)
+    existing_match_cols = {row[1] for row in c.execute("PRAGMA table_info(matches)").fetchall()}
+    if "created_at" not in existing_match_cols:
+        c.execute("ALTER TABLE matches ADD COLUMN created_at TEXT")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS match_invites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,17 +117,6 @@ def init_db():
             user_id INTEGER NOT NULL,
             token TEXT UNIQUE NOT NULL,
             created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS match_photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            photo BLOB NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            FOREIGN KEY (match_id) REFERENCES matches(id),
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
@@ -365,8 +358,8 @@ def create_match(match_date, ruleset_id, host_id, invite_assignments):
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status) VALUES (?,?,?,?,?)",
-            (str(match_date), ruleset_id, host_id, None, "einladung_offen")
+            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at) VALUES (?,?,?,?,?,?)",
+            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()))
         )
         match_id = c.lastrowid
         c.execute(
@@ -471,13 +464,14 @@ def finalize_match(match_id, winner, stats_by_participant_id):
     finally:
         conn.close()
 
-def get_all_completed_matches():
+def get_all_matches_feed():
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner AS Gewinner, u.display_name AS Host
+            SELECT m.id, m.match_date AS Datum, r.name AS Regelwerk, m.winner AS Gewinner,
+                   u.display_name AS Host, m.status AS Status
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id JOIN users u ON m.host_id = u.id
-            WHERE m.status = 'abgeschlossen'
+            WHERE m.status IN ('einladung_offen', 'abgeschlossen')
             ORDER BY m.match_date DESC, m.id DESC
         """, conn)
     finally:
@@ -488,8 +482,7 @@ def get_match_participants_view(match_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT mp.team AS Team, u.display_name AS Spieler, mp.treffer AS Treffer, mp.wuerfe AS Wuerfe,
-                   mp.platzierung AS Platzierung
+            SELECT mp.team AS Team, u.display_name AS Spieler, mp.treffer AS Treffer, mp.wuerfe AS Wuerfe
             FROM match_participants mp JOIN users u ON mp.user_id = u.id
             WHERE mp.match_id = ?
             ORDER BY mp.team, u.display_name
@@ -503,33 +496,10 @@ def delete_match(match_id):
     try:
         conn.execute("DELETE FROM match_participants WHERE match_id = ?", (match_id,))
         conn.execute("DELETE FROM match_invites WHERE match_id = ?", (match_id,))
-        conn.execute("DELETE FROM match_photos WHERE match_id = ?", (match_id,))
         conn.execute("DELETE FROM matches WHERE id = ?", (match_id,))
         conn.commit()
     finally:
         conn.close()
-
-def add_match_photo(match_id, user_id, photo_bytes):
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO match_photos (match_id, user_id, photo, uploaded_at) VALUES (?,?,?,?)",
-            (match_id, user_id, photo_bytes, str(datetime.now()))
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-def get_match_photos(match_id):
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT mp.photo, u.display_name FROM match_photos mp JOIN users u ON mp.user_id = u.id WHERE mp.match_id = ? ORDER BY mp.id",
-            (match_id,)
-        ).fetchall()
-    finally:
-        conn.close()
-    return rows
 
 def get_player_stats_for_friends(user_id):
     friend_ids = get_friends(user_id)["id"].tolist() + [user_id]
@@ -542,8 +512,7 @@ def get_player_stats_for_friends(user_id):
                    SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS Siege,
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote,
-                   ROUND(AVG(mp.platzierung), 2) AS "Ø Individuelle Platzierung"
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
@@ -566,8 +535,7 @@ def get_stats_for_single_user(target_user_id):
                    SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS Siege,
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote,
-                   ROUND(AVG(mp.platzierung), 2) AS "Ø Individuelle Platzierung"
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS Trefferquote
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
@@ -585,7 +553,7 @@ def get_match_history_for_player(user_id):
     try:
         df = pd.read_sql("""
             SELECT m.match_date AS Datum, m.id AS match_id,
-                   mp.treffer AS Treffer, mp.wuerfe AS Wuerfe, mp.platzierung AS Platzierung,
+                   mp.treffer AS Treffer, mp.wuerfe AS Wuerfe,
                    CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END AS Sieg
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
@@ -595,8 +563,11 @@ def get_match_history_for_player(user_id):
     finally:
         conn.close()
     if not df.empty:
-        df["Trefferquote"] = (df["Treffer"] / df["Wuerfe"].replace(0, pd.NA)).round(3)
-        df["Kumulierte Siegquote"] = (df["Sieg"].cumsum() / (df.index + 1)).round(3)
+        df["Netto_Sieg"] = df["Sieg"].apply(lambda x: 1 if x == 1 else -1)
+        df["Punktekonto_Siege"] = df["Netto_Sieg"].cumsum()
+        df["Verfehlt"] = df["Wuerfe"] - df["Treffer"]
+        df["Netto_Treffer"] = df["Treffer"] - df["Verfehlt"]
+        df["Punktekonto_Treffer"] = df["Netto_Treffer"].cumsum()
         df["Spielnummer"] = df.index + 1
     return df
 
@@ -616,31 +587,49 @@ def get_full_match_list_for_user(target_user_id):
         conn.close()
     return df
 
-def render_scrollable_photos(photo_rows):
-    if not photo_rows:
-        return
-    imgs_html = ""
-    for photo_bytes, uploader_name in photo_rows:
-        b64 = base64.b64encode(photo_bytes).decode()
-        imgs_html += f"""
-        <div style="display:inline-block; margin-right:10px; text-align:center; vertical-align:top;">
-            <img src="data:image/jpeg;base64,{b64}" style="height:180px; border-radius:8px;" />
-            <div style="font-size:12px; color:gray;">{uploader_name}</div>
-        </div>
-        """
-    st.markdown(
-        f'<div style="overflow-x:auto; white-space:nowrap; padding:8px 0;">{imgs_html}</div>',
-        unsafe_allow_html=True
-    )
-
-def render_match_participants_colored(participants_df):
-    winner = participants_df.attrs.get("winner")
-    line_html = ""
+def render_match_names_colored(participants_df, winner):
+    parts = []
     for _, row in participants_df.iterrows():
         color = "#2e8b57" if row["Team"] == winner else "#c0392b"
-        stats_txt = f"({row['Treffer']} Treffer / {row['Wuerfe']} Würfe, Platz {row['Platzierung']})" if pd.notna(row["Treffer"]) else ""
-        line_html += f'<span style="color:{color}; font-weight:600; margin-right:12px;">{row["Spieler"]} {stats_txt}</span>'
-    st.markdown(line_html, unsafe_allow_html=True)
+        parts.append(f'<span style="color:{color}; font-weight:600; margin-right:14px;">{row["Spieler"]}</span>')
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+def render_running_match_names(participants_df):
+    parts = []
+    for _, row in participants_df.iterrows():
+        parts.append(f'<span style="color:#333; font-weight:500; margin-right:14px;">{row["Spieler"]}</span>')
+    parts.append('<span style="color:#2e8b57; font-weight:700; margin-left:8px;">● Spiel läuft</span>')
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+def render_match_stats_table(participants_df, winner):
+    rows_html = ""
+    for _, row in participants_df.iterrows():
+        color = "#2e8b57" if row["Team"] == winner else "#c0392b"
+        treffer = row["Treffer"]
+        wuerfe = row["Wuerfe"]
+        quote = f"{(treffer/wuerfe*100):.1f}%" if wuerfe and wuerfe > 0 else "–"
+        rows_html += f"""
+        <tr>
+            <td style="padding:4px 10px; color:{color}; font-weight:600;">{row['Spieler']}</td>
+            <td style="padding:4px 10px;">{row['Team']}</td>
+            <td style="padding:4px 10px;">{treffer if pd.notna(treffer) else '–'}</td>
+            <td style="padding:4px 10px;">{wuerfe if pd.notna(wuerfe) else '–'}</td>
+            <td style="padding:4px 10px;">{quote}</td>
+        </tr>
+        """
+    table_html = f"""
+    <table style="width:100%; border-collapse:collapse; font-size:14px;">
+        <tr style="border-bottom:1px solid #ddd; text-align:left; color:gray;">
+            <th style="padding:4px 10px;">Spieler</th>
+            <th style="padding:4px 10px;">Team</th>
+            <th style="padding:4px 10px;">Treffer</th>
+            <th style="padding:4px 10px;">Würfe</th>
+            <th style="padding:4px 10px;">Trefferquote</th>
+        </tr>
+        {rows_html}
+    </table>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
 
 try:
     init_db()
@@ -782,7 +771,20 @@ if st.sidebar.button("Abmelden"):
 
 st.title("Bierball League")
 
-tabs = st.tabs(["Profil", "Freunde", "Neues Spiel", "Einladungen", "Spielverlauf", "Rangliste"])
+pending_friend_count = len(get_pending_friend_requests(user_id))
+pending_invite_count = len(get_pending_invites(user_id))
+
+all_matches_feed = get_all_matches_feed()
+current_matches_total = len(all_matches_feed)
+if "last_seen_matches_total" not in st.session_state:
+    st.session_state.last_seen_matches_total = current_matches_total
+new_matches_count = max(0, current_matches_total - st.session_state.last_seen_matches_total)
+
+freunde_label = f"Freunde 🔴{pending_friend_count}" if pending_friend_count > 0 else "Freunde"
+einladungen_label = f"Einladungen 🔴{pending_invite_count}" if pending_invite_count > 0 else "Einladungen"
+spiele_label = f"Spiele 🔴{new_matches_count}" if new_matches_count > 0 else "Spiele"
+
+tabs = st.tabs(["Profil", freunde_label, "Neues Spiel", einladungen_label, spiele_label, "Rangliste"])
 
 # --- TAB: Profil ---
 with tabs[0]:
@@ -815,11 +817,10 @@ with tabs[0]:
         st.info("Noch keine abgeschlossenen Spiele.")
     else:
         r = own_stats.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Spiele", int(r["Spiele"]))
         c2.metric("Siegquote", f"{r['Siegquote']*100:.1f}%")
         c3.metric("Trefferquote", f"{r['Trefferquote']*100:.1f}%" if pd.notna(r["Trefferquote"]) else "–")
-        c4.metric("Ø Individuelle Platzierung", r["Ø Individuelle Platzierung"])
 
 # --- TAB: Freunde ---
 with tabs[1]:
@@ -898,11 +899,10 @@ with tabs[1]:
                     st.info("Dieser Nutzer hat noch keine abgeschlossenen Spiele.")
                 else:
                     fr_row = fstats.iloc[0]
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3 = st.columns(3)
                     c1.metric("Spiele", int(fr_row["Spiele"]))
                     c2.metric("Siegquote", f"{fr_row['Siegquote']*100:.1f}%")
                     c3.metric("Trefferquote", f"{fr_row['Trefferquote']*100:.1f}%" if pd.notna(fr_row["Trefferquote"]) else "–")
-                    c4.metric("Ø Individuelle Platzierung", fr_row["Ø Individuelle Platzierung"])
 
                 st.markdown("**Alle Spiele, an denen dieser Nutzer teilgenommen hat (zur Transparenz sichtbar für alle Freunde):**")
                 friend_matches = get_full_match_list_for_user(fid)
@@ -912,10 +912,9 @@ with tabs[1]:
                     for _, fm in friend_matches.iterrows():
                         with st.expander(f"{fm['Datum']} – {fm['Regelwerk']} (Host: {fm['Host']})"):
                             pdf = get_match_participants_view(int(fm["id"]))
-                            pdf.attrs["winner"] = fm["winner"]
-                            render_match_participants_colored(pdf)
-                            photos = get_match_photos(int(fm["id"]))
-                            render_scrollable_photos(photos)
+                            render_match_names_colored(pdf, fm["winner"])
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            render_match_stats_table(pdf, fm["winner"])
 
 # --- TAB: Neues Spiel ---
 with tabs[2]:
@@ -1040,35 +1039,33 @@ with tabs[3]:
                     respond_invite(int(inv["invite_id"]), False)
                     st.rerun()
 
-# --- TAB: Spielverlauf ---
+# --- TAB: Spiele ---
 with tabs[4]:
-    st.header("Spielverlauf (abgeschlossene Spiele)")
-    matches_df = get_all_completed_matches()
-    if matches_df.empty:
-        st.info("Noch keine abgeschlossenen Spiele.")
+    st.header("Spiele")
+    if all_matches_feed.empty:
+        st.info("Noch keine Spiele vorhanden.")
     else:
-        for _, m in matches_df.iterrows():
+        for _, m in all_matches_feed.iterrows():
             with st.expander(f"{m['Datum']} – {m['Regelwerk']} (Host: {m['Host']})"):
                 pdf = get_match_participants_view(int(m["id"]))
-                pdf.attrs["winner"] = m["Gewinner"]
-                render_match_participants_colored(pdf)
-
-                st.markdown("**Fotos zu diesem Spiel:**")
-                photos = get_match_photos(int(m["id"]))
-                render_scrollable_photos(photos)
+                if m["Status"] == "einladung_offen":
+                    render_running_match_names(pdf)
+                else:
+                    render_match_names_colored(pdf, m["Gewinner"])
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    render_match_stats_table(pdf, m["Gewinner"])
 
                 is_participant = user_id in get_match_participants_for_completion(int(m["id"]))["user_id"].values
-                if is_participant:
-                    uploaded = st.file_uploader("Eigenes Foto zu diesem Spiel hochladen", type=["png", "jpg", "jpeg"], key=f"photo_up_{m['id']}")
-                    if uploaded is not None:
-                        add_match_photo(int(m["id"]), user_id, uploaded.read())
-                        st.success("Foto hochgeladen!")
-                        st.rerun()
+                is_host = False
+                open_match_row = get_open_matches_for_host(user_id)
+                if not open_match_row.empty and int(m["id"]) in open_match_row["id"].values:
+                    is_host = True
 
-                if st.button("Dieses Spiel löschen", key=f"del_hist_{m['id']}"):
-                    delete_match(int(m["id"]))
-                    st.success("Spiel gelöscht.")
-                    st.rerun()
+                if is_host or is_participant:
+                    if st.button("Dieses Spiel löschen", key=f"del_hist_{m['id']}"):
+                        delete_match(int(m["id"]))
+                        st.success("Spiel gelöscht.")
+                        st.rerun()
 
 # --- TAB: Rangliste ---
 with tabs[5]:
@@ -1088,29 +1085,35 @@ with tabs[5]:
         selected_name = st.selectbox("Spieler auswählen", ranked_df["Spieler"].tolist(), key="rangliste_player_select")
         srow = ranked_df.loc[ranked_df["Spieler"] == selected_name].iloc[0]
         selected_uid = int(srow["id"])
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Spiele", int(srow["Spiele"]))
         c2.metric("Siegquote", f"{srow['Siegquote']*100:.1f}%")
         c3.metric("Trefferquote", f"{srow['Trefferquote']*100:.1f}%" if pd.notna(srow["Trefferquote"]) else "–")
-        c4.metric("Ø Individuelle Platzierung", srow["Ø Individuelle Platzierung"])
 
         st.divider()
         st.subheader(f"Entwicklung über die Zeit – {selected_name}")
+        st.caption("Bei jedem Sieg bzw. Treffer bewegt sich die Linie einen Schritt nach oben, bei jeder Niederlage bzw. Fehlwurf einen Schritt nach unten. Ein ausgeglichener Spieler bleibt nahe der Null-Linie.")
         history_df = get_match_history_for_player(selected_uid)
         if history_df.empty or len(history_df) < 2:
             st.caption("Noch nicht genug abgeschlossene Spiele für eine Zeitverlaufs-Grafik (mindestens 2 nötig).")
         else:
-            fig_siegquote = px.line(history_df, x="Spielnummer", y="Kumulierte Siegquote", markers=True,
-                                     title="Kumulierte Siegquote im Verlauf")
-            fig_siegquote.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig_siegquote, use_container_width=True)
+            fig_siege = go.Figure()
+            fig_siege.add_trace(go.Scatter(
+                x=history_df["Spielnummer"], y=history_df["Punktekonto_Siege"],
+                mode="lines+markers", line=dict(color="#2e8b57"), name="Punktekonto Siege"
+            ))
+            fig_siege.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_siege.update_layout(title="Sieg/Niederlage-Verlauf (Zufallsweg)", xaxis_title="Spielnummer", yaxis_title="Punktekonto")
+            st.plotly_chart(fig_siege, use_container_width=True)
 
-            fig_trefferquote = px.line(history_df, x="Spielnummer", y="Trefferquote", markers=True,
-                                        title="Trefferquote pro Spiel")
-            fig_trefferquote.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig_trefferquote, use_container_width=True)
+            fig_treffer = go.Figure()
+            fig_treffer.add_trace(go.Scatter(
+                x=history_df["Spielnummer"], y=history_df["Punktekonto_Treffer"],
+                mode="lines+markers", line=dict(color="#2980b9"), name="Punktekonto Treffer"
+            ))
+            fig_treffer.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_treffer.update_layout(title="Treffer/Fehlwurf-Verlauf (Zufallsweg)", xaxis_title="Spielnummer", yaxis_title="Punktekonto")
+            st.plotly_chart(fig_treffer, use_container_width=True)
 
-            fig_platzierung = px.line(history_df, x="Spielnummer", y="Platzierung", markers=True,
-                                       title="Individuelle Platzierung pro Spiel")
-            fig_platzierung.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig_platzierung, use_container_width=True)
+st.session_state.last_seen_matches_total = current_matches_total
+
