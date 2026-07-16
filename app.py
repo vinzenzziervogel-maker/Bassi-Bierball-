@@ -429,7 +429,7 @@ def get_match_invite_status(match_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT u.display_name AS Spieler, mi.team AS Team, mi.status AS Status
+            SELECT u.display_name AS "Spieler", mi.team AS "Team", mi.status AS "Status"
             FROM match_invites mi JOIN users u ON mi.user_id = u.id
             WHERE mi.match_id = %s
         """, conn, params=(match_id,))
@@ -441,7 +441,7 @@ def get_match_participants_for_completion(match_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT mp.id, u.id AS user_id, u.display_name AS Spieler, mp.team AS Team
+            SELECT mp.id, u.id AS user_id, u.display_name AS "Spieler", mp.team AS "Team"
             FROM match_participants mp JOIN users u ON mp.user_id = u.id
             WHERE mp.match_id = %s
             ORDER BY mp.team, u.display_name
