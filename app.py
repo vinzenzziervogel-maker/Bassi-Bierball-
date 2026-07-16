@@ -1,4 +1,4 @@
-import streamlit as st
+ import streamlit as st
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -8,8 +8,10 @@ import os
 from datetime import date, datetime
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ADMIN_USERNAME = "469Vini"
 
 SECURITY_QUESTIONS = {
     1: "Wie hieß dein erstes Haustier?",
@@ -39,9 +41,13 @@ def init_db():
             sq1_hash TEXT,
             sq2_id INTEGER,
             sq2_salt TEXT,
-            sq2_hash TEXT
+            sq2_hash TEXT,
+            is_admin BOOLEAN DEFAULT FALSE
         )
     """)
+    c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE")
+    c.execute("UPDATE users SET is_admin = TRUE WHERE username = %s", (ADMIN_USERNAME,))
+    conn.commit()
     c.execute("""
         CREATE TABLE IF NOT EXISTS friendships (
             id SERIAL PRIMARY KEY,
@@ -70,11 +76,13 @@ def init_db():
             winner TEXT,
             status TEXT NOT NULL,
             created_at TEXT,
-            ort TEXT
+            ort TEXT,
+            notizen TEXT
         )
     """)
     c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TEXT")
     c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS ort TEXT")
+    c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS notizen TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS match_invites (
@@ -151,7 +159,7 @@ def verify_login(username, password):
     try:
         c = conn.cursor()
         c.execute(
-            "SELECT id, password_hash, salt, display_name FROM users WHERE username = %s",
+            "SELECT id, password_hash, salt, display_name, is_admin FROM users WHERE username = %s",
             (username,)
         )
         row = c.fetchone()
@@ -159,9 +167,9 @@ def verify_login(username, password):
         conn.close()
     if row is None:
         return None
-    user_id, ph, salt, display_name = row
+    user_id, ph, salt, display_name, is_admin = row
     if hash_password(password, salt) == ph:
-        return {"id": user_id, "display_name": display_name, "username": username}
+        return {"id": user_id, "display_name": display_name, "username": username, "is_admin": bool(is_admin)}
     return None
 
 def get_security_questions_for_user(username):
@@ -224,7 +232,7 @@ def verify_remember_token(token):
     try:
         c = conn.cursor()
         c.execute(
-            "SELECT u.id, u.username, u.display_name FROM remember_tokens rt JOIN users u ON rt.user_id = u.id WHERE rt.token = %s",
+            "SELECT u.id, u.username, u.display_name, u.is_admin FROM remember_tokens rt JOIN users u ON rt.user_id = u.id WHERE rt.token = %s",
             (token,)
         )
         row = c.fetchone()
@@ -232,7 +240,7 @@ def verify_remember_token(token):
         conn.close()
     if row is None:
         return None
-    return {"id": row[0], "username": row[1], "display_name": row[2]}
+    return {"id": row[0], "username": row[1], "display_name": row[2], "is_admin": bool(row[3])}
 
 def delete_remember_token(token):
     conn = get_conn()
@@ -252,6 +260,60 @@ def get_user(user_id):
     finally:
         conn.close()
     return row
+
+def get_total_user_count():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        count = c.fetchone()[0]
+    finally:
+        conn.close()
+    return count
+
+def get_all_users_overview():
+    conn = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT id, username, display_name, is_admin FROM users ORDER BY id",
+            conn
+        )
+    finally:
+        conn.close()
+    return df
+
+def get_all_matches_for_admin():
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT m.id, m.match_date AS "Datum", r.name AS "Regelwerk", m.status AS "Status",
+                   u.display_name AS "Host", m.ort AS "Ort"
+            FROM matches m JOIN rulesets r ON m.ruleset_id = r.id JOIN users u ON m.host_id = u.id
+            ORDER BY m.match_date DESC, m.id DESC
+        """, conn)
+    finally:
+        conn.close()
+    return df
+
+def delete_user_account(target_user_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id FROM matches WHERE host_id = %s", (target_user_id,))
+        hosted_match_ids = [r[0] for r in c.fetchall()]
+        for mid in hosted_match_ids:
+            c.execute("DELETE FROM match_participants WHERE match_id = %s", (mid,))
+            c.execute("DELETE FROM match_invites WHERE match_id = %s", (mid,))
+            c.execute("DELETE FROM matches WHERE id = %s", (mid,))
+
+        c.execute("DELETE FROM match_participants WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM match_invites WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM friendships WHERE user_id = %s OR friend_id = %s", (target_user_id, target_user_id))
+        c.execute("DELETE FROM remember_tokens WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM users WHERE id = %s", (target_user_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
 def update_profile(user_id, display_name):
     conn = get_conn()
@@ -351,13 +413,13 @@ def save_custom_ruleset(name, flags):
         conn.close()
     return ok
 
-def create_match(match_date, ruleset_id, host_id, invite_assignments, ort=""):
+def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen=""):
     conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort)
+            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort, notizen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort, notizen)
         )
         match_id = c.fetchone()[0]
         c.execute(
@@ -416,7 +478,7 @@ def get_open_matches_for_host(host_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT m.id, m.match_date, r.name AS regelwerk, m.status, m.ort AS ort
+            SELECT m.id, m.match_date, r.name AS regelwerk, m.status, m.ort AS ort, m.notizen AS notizen
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id
             WHERE m.host_id = %s AND m.status = 'einladung_offen'
             ORDER BY m.match_date DESC
@@ -469,7 +531,7 @@ def get_all_matches_feed():
     try:
         df = pd.read_sql("""
             SELECT m.id, m.match_date AS "Datum", r.name AS "Regelwerk", m.winner AS "Gewinner",
-                   u.display_name AS "Host", m.host_id AS "HostId", m.status AS "Status", m.ort AS "Ort"
+                   u.display_name AS "Host", m.host_id AS "HostId", m.status AS "Status", m.ort AS "Ort", m.notizen AS "Notizen"
             FROM matches m JOIN rulesets r ON m.ruleset_id = r.id JOIN users u ON m.host_id = u.id
             WHERE m.status IN ('einladung_offen', 'abgeschlossen')
             ORDER BY m.match_date DESC, m.id DESC
@@ -740,6 +802,54 @@ display_name = st.session_state.user["display_name"]
 st_autorefresh(interval=15000, key="live_refresh")
 
 st.sidebar.write(f"Angemeldet als **{display_name}**")
+
+APP_URL = os.environ.get("APP_URL", "https://bierball-league.onrender.com")
+SHARE_TEXT = "Spiele ranked Bierball mit der Bassozial Bierball App: " + APP_URL
+
+share_html = f"""
+<div style="margin-bottom: 10px;">
+  <button id="share-btn" style="
+      width: 100%;
+      padding: 0.6rem 1rem;
+      background-color: #2e8b57;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+  ">📤 App teilen</button>
+</div>
+<script>
+  const btn = document.getElementById("share-btn");
+  btn.addEventListener("click", async () => {{
+    const shareData = {{
+      title: "Bierball League",
+      text: {SHARE_TEXT!r},
+      url: {APP_URL!r}
+    }};
+    if (navigator.share) {{
+      try {{
+        await navigator.share(shareData);
+      }} catch (err) {{
+        console.log("Teilen abgebrochen oder fehlgeschlagen:", err);
+      }}
+    }} else {{
+      try {{
+        await navigator.clipboard.writeText({SHARE_TEXT!r});
+        btn.innerText = "✅ Link kopiert!";
+        setTimeout(() => {{ btn.innerText = "📤 App teilen"; }}, 2000);
+      }} catch (err) {{
+        alert({SHARE_TEXT!r});
+      }}
+    }}
+  }});
+</script>
+"""
+
+with st.sidebar:
+    components.html(share_html, height=60)
+
 if st.sidebar.button("Abmelden"):
     if "remember_token" in st.query_params:
         try:
@@ -765,7 +875,13 @@ freunde_label = f"Freunde 🔴{pending_friend_count}" if pending_friend_count > 
 einladungen_label = f"Einladungen 🔴{pending_invite_count}" if pending_invite_count > 0 else "Einladungen"
 spiele_label = f"Spiele 🔴{new_matches_count}" if new_matches_count > 0 else "Spiele"
 
-tabs = st.tabs(["Profil", freunde_label, "Neues Spiel", einladungen_label, spiele_label, "Rangliste"])
+is_admin_user = bool(st.session_state.user.get("is_admin", False))
+
+tab_names = ["Profil", freunde_label, "Neues Spiel", einladungen_label, spiele_label, "Rangliste"]
+if is_admin_user:
+    tab_names.append("⚙️ Admin")
+
+tabs = st.tabs(tab_names)
 
 # --- TAB: Profil ---
 with tabs[0]:
@@ -904,6 +1020,7 @@ with tabs[2]:
             chosen_ruleset_name = st.selectbox("Regelwerk", ruleset_names)
 
         ruleset_id = None
+        match_notizen = ""
         if chosen_ruleset_name == "Individuell (neu definieren)":
             st.subheader("Individuelles Regelwerk definieren")
             new_name = st.text_input("Name des neuen Regelwerks")
@@ -925,6 +1042,11 @@ with tabs[2]:
                 f"Von oben werfen Pflicht: {'Ja' if rrow.wurf_von_oben else 'Nein'}  \n"
                 f"3-Sekunden-Regel: {'Ja' if rrow.drei_sekunden_regel else 'Nein'}"
             )
+
+        match_notizen = st.text_area(
+            "Individuelle Zusatzregeln (optional)",
+            placeholder="z.B. Sonderregeln, Ausnahmen oder Absprachen für dieses Spiel..."
+        )
 
         st.divider()
         st.subheader("Team A")
@@ -949,7 +1071,7 @@ with tabs[2]:
                 for name in team_b_friends:
                     uid = int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0])
                     invite_assignments[uid] = "B"
-                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip())
+                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip(), match_notizen.strip())
                 st.success("Spiel erstellt und Einladungen versendet!")
                 st.rerun()
 
@@ -965,6 +1087,8 @@ with tabs[2]:
             status_label = "bereit" if all_accepted else "warte auf Zusagen"
             ort_display = f" – {m['ort']}" if m.get("ort") else ""
             with st.expander(f"Spiel {m['id']} – {m['match_date']}{ort_display} ({m['regelwerk']}) ({status_label})"):
+                if m.get("notizen"):
+                    st.info(f"**Individuelle Zusatzregeln:** {m['notizen']}")
                 st.dataframe(invite_status, use_container_width=True, hide_index=True)
 
                 participants = get_match_participants_for_completion(int(m["id"]))
@@ -1028,6 +1152,8 @@ with tabs[4]:
             with st.expander(title):
                 pdf = get_match_participants_view(int(m["id"]))
                 render_teams_vs(pdf)
+                if m.get("Notizen"):
+                    st.info(f"**Individuelle Zusatzregeln:** {m['Notizen']}")
                 if m["Status"] == "einladung_offen":
                     render_running_match_names(pdf)
                 else:
@@ -1035,8 +1161,9 @@ with tabs[4]:
                     render_match_stats_table(pdf, m["Gewinner"])
 
                 is_host = (int(m["HostId"]) == user_id)
-                if is_host:
-                    if st.button("Dieses Spiel löschen", key=f"del_hist_{m['id']}"):
+                if is_host or is_admin_user:
+                    delete_label = "Dieses Spiel löschen" if is_host else "Dieses Spiel löschen (Admin)"
+                    if st.button(delete_label, key=f"del_hist_{m['id']}"):
                         delete_match(int(m["id"]))
                         st.success("Spiel gelöscht.")
                         st.rerun()
@@ -1086,5 +1213,59 @@ with tabs[5]:
             ))
             fig_treffer.update_layout(title="Trefferquote im Verlauf", xaxis_title="Spielnummer", yaxis_title="Trefferquote (%)", yaxis_range=[0, 100])
             st.plotly_chart(fig_treffer, use_container_width=True)
+
+# --- TAB: Admin ---
+if is_admin_user:
+    with tabs[6]:
+        st.header("⚙️ Admin-Bereich")
+        st.caption("Dieser Bereich ist nur für Administratoren sichtbar.")
+
+        total_users = get_total_user_count()
+        st.metric("Registrierte Nutzer insgesamt", total_users)
+
+        st.divider()
+        st.subheader("Alle registrierten Nutzer")
+        users_overview = get_all_users_overview()
+        st.dataframe(users_overview, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Account löschen")
+        st.caption("Löscht den Account und alle zugehörigen Daten (Freundschaften, Einladungen, Spielteilnahmen sowie von diesem Nutzer gehostete Spiele) unwiderruflich.")
+        for _, u_row in users_overview.iterrows():
+            target_uid = int(u_row["id"])
+            if target_uid == user_id:
+                continue
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                admin_tag = " (Admin)" if u_row["is_admin"] else ""
+                st.write(f"**{u_row['display_name']}** (@{u_row['username']}){admin_tag}")
+            with c2:
+                confirm_key = f"confirm_del_user_{target_uid}"
+                if st.session_state.get(confirm_key, False):
+                    if st.button("Bestätigen", key=f"confirm_btn_{target_uid}", type="primary"):
+                        delete_user_account(target_uid)
+                        st.session_state[confirm_key] = False
+                        st.success(f"Account @{u_row['username']} wurde gelöscht.")
+                        st.rerun()
+                else:
+                    if st.button("Löschen", key=f"del_user_{target_uid}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+
+        st.divider()
+        st.subheader("Alle Spiele (inkl. Löschen)")
+        admin_matches = get_all_matches_for_admin()
+        if admin_matches.empty:
+            st.info("Keine Spiele vorhanden.")
+        else:
+            for _, am in admin_matches.iterrows():
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.write(f"**Spiel {am['id']}** – {am['Datum']} ({am['Regelwerk']}), Host: {am['Host']}, Status: {am['Status']}")
+                with c2:
+                    if st.button("Löschen", key=f"admin_del_{am['id']}"):
+                        delete_match(int(am["id"]))
+                        st.success(f"Spiel {am['id']} gelöscht.")
+                        st.rerun()
 
 st.session_state.last_seen_matches_total = current_matches_total
