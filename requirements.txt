@@ -2,4 +2,3 @@ streamlit
 psycopg2-binary
 pandas
 plotly
-streamlit-autorefresh
