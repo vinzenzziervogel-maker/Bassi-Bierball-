@@ -102,6 +102,34 @@ def init_db():
     """)
     conn.commit()
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            creator_id INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS group_members (
+            id SERIAL PRIMARY KEY,
+            group_id INTEGER NOT NULL REFERENCES groups(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            UNIQUE(group_id, user_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS group_invites (
+            id SERIAL PRIMARY KEY,
+            group_id INTEGER NOT NULL REFERENCES groups(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            status TEXT NOT NULL,
+            invited_by INTEGER NOT NULL REFERENCES users(id)
+        )
+    """)
+    c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id)")
+    conn.commit()
+
     c.execute("SELECT COUNT(*) FROM rulesets")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -275,6 +303,35 @@ def get_all_matches_for_admin():
         conn.close()
     return df
 
+def get_all_groups_for_admin():
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT g.id, g.name AS "Gruppe", u.display_name AS "Ersteller", g.created_at AS "Erstellt am",
+                   COALESCE(mc.match_count, 0) AS "Spiele"
+            FROM groups g
+            JOIN users u ON g.creator_id = u.id
+            LEFT JOIN (
+                SELECT group_id, COUNT(*) AS match_count FROM matches WHERE group_id IS NOT NULL GROUP BY group_id
+            ) mc ON mc.group_id = g.id
+            ORDER BY g.name
+        """, conn)
+    finally:
+        conn.close()
+    return df
+
+def delete_group(group_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE matches SET group_id = NULL WHERE group_id = %s", (group_id,))
+        c.execute("DELETE FROM group_invites WHERE group_id = %s", (group_id,))
+        c.execute("DELETE FROM group_members WHERE group_id = %s", (group_id,))
+        c.execute("DELETE FROM groups WHERE id = %s", (group_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
 def delete_user_account(target_user_id):
     conn = get_conn()
     try:
@@ -368,6 +425,167 @@ def get_friends(user_id):
         conn.close()
     return df
 
+def create_group(name, creator_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO groups (name, creator_id, created_at) VALUES (%s,%s,%s) RETURNING id",
+            (name, creator_id, str(datetime.now()))
+        )
+        group_id = c.fetchone()[0]
+        c.execute("INSERT INTO group_members (group_id, user_id) VALUES (%s,%s)", (group_id, creator_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return group_id
+
+def get_my_groups(user_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT g.id, g.name, g.creator_id
+            FROM groups g JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.user_id = %s
+            ORDER BY g.name
+        """, conn, params=(user_id,))
+    finally:
+        conn.close()
+    return df
+
+def get_group_members(group_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT u.id, u.display_name, u.username
+            FROM group_members gm JOIN users u ON u.id = gm.user_id
+            WHERE gm.group_id = %s
+            ORDER BY u.display_name
+        """, conn, params=(group_id,))
+    finally:
+        conn.close()
+    return df
+
+def invite_to_group(group_id, user_id, invited_by):
+    conn = get_conn()
+    ok = True
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+        if c.fetchone() is not None:
+            ok = False
+        else:
+            c.execute(
+                "INSERT INTO group_invites (group_id, user_id, status, invited_by) VALUES (%s,%s,%s,%s)",
+                (group_id, user_id, "ausstehend", invited_by)
+            )
+            conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        ok = False
+    finally:
+        conn.close()
+    return ok
+
+def get_pending_group_invites(user_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT gi.id AS invite_id, g.id AS group_id, g.name AS group_name, u.display_name AS invited_by_name
+            FROM group_invites gi
+            JOIN groups g ON gi.group_id = g.id
+            JOIN users u ON gi.invited_by = u.id
+            WHERE gi.user_id = %s AND gi.status = 'ausstehend'
+        """, conn, params=(user_id,))
+    finally:
+        conn.close()
+    return df
+
+def respond_group_invite(invite_id, accept):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT group_id, user_id FROM group_invites WHERE id = %s", (invite_id,))
+        row = c.fetchone()
+        if row:
+            group_id, uid = row
+            if accept:
+                c.execute(
+                    "INSERT INTO group_members (group_id, user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                    (group_id, uid)
+                )
+                c.execute("UPDATE group_invites SET status = 'angenommen' WHERE id = %s", (invite_id,))
+            else:
+                c.execute("UPDATE group_invites SET status = 'abgelehnt' WHERE id = %s", (invite_id,))
+            conn.commit()
+    finally:
+        conn.close()
+
+def find_common_groups(user_ids):
+    if not user_ids:
+        return pd.DataFrame(columns=["id", "name"])
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT g.id, g.name
+            FROM groups g
+            WHERE NOT EXISTS (
+                SELECT 1 FROM (SELECT UNNEST(%s::int[]) AS uid) needed
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = needed.uid
+                )
+            )
+            ORDER BY g.name
+        """, conn, params=(user_ids,))
+    finally:
+        conn.close()
+    return df
+
+def get_group_player_stats(group_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT u.id, u.display_name AS "Spieler",
+                   COUNT(mp.id) AS "Spiele",
+                   SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
+                   ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
+                   ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
+            FROM match_participants mp
+            JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen' AND m.group_id = %s
+            JOIN users u ON mp.user_id = u.id
+            GROUP BY u.id, u.display_name
+            ORDER BY "Siege" DESC, "Trefferquote" DESC
+        """, conn, params=(group_id,))
+    finally:
+        conn.close()
+    if not df.empty:
+        df["Siegquote"] = (df["Siege"] / df["Spiele"]).round(3)
+    return df
+
+def get_group_match_history_for_player(group_id, user_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT m.match_date AS "Datum", m.id AS "match_id",
+                   mp.treffer AS "Treffer", mp.wuerfe AS "Wuerfe",
+                   CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END AS "Sieg"
+            FROM match_participants mp
+            JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen' AND m.group_id = %s
+            WHERE mp.user_id = %s
+            ORDER BY m.match_date ASC, m.id ASC
+        """, conn, params=(group_id, user_id))
+    finally:
+        conn.close()
+    if not df.empty:
+        df["Spielnummer"] = df.index + 1
+        df["Kum_Siege"] = df["Sieg"].cumsum()
+        df["Siegquote_Verlauf"] = (df["Kum_Siege"] / df["Spielnummer"] * 100).round(1)
+        df["Kum_Treffer"] = df["Treffer"].cumsum()
+        df["Kum_Wuerfe"] = df["Wuerfe"].cumsum()
+        df["Trefferquote_Verlauf"] = (df["Kum_Treffer"] / df["Kum_Wuerfe"].replace(0, pd.NA) * 100).round(1)
+    return df
+
 def get_rulesets():
     conn = get_conn()
     try:
@@ -393,13 +611,13 @@ def save_custom_ruleset(name, flags):
         conn.close()
     return ok
 
-def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen=""):
+def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen="", group_id=None):
     conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort, notizen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort, notizen)
+            "INSERT INTO matches (match_date, ruleset_id, host_id, winner, status, created_at, ort, notizen, group_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (str(match_date), ruleset_id, host_id, None, "einladung_offen", str(datetime.now()), ort, notizen, group_id)
         )
         match_id = c.fetchone()[0]
         c.execute(
@@ -841,7 +1059,7 @@ if st.sidebar.button("Abmelden"):
 st.title("Bassi Bierball")
 
 pending_friend_count = len(get_pending_friend_requests(user_id))
-pending_invite_count = len(get_pending_invites(user_id))
+pending_invite_count = len(get_pending_invites(user_id)) + len(get_pending_group_invites(user_id))
 
 all_matches_feed = get_all_matches_feed()
 current_matches_total = len(all_matches_feed)
@@ -979,6 +1197,45 @@ with tabs[1]:
                             st.markdown("<br>", unsafe_allow_html=True)
                             render_match_stats_table(pdf, fm["winner"])
 
+    st.divider()
+    st.subheader("Meine Gruppen")
+    st.caption("Erstelle Gruppen mit deinen Freunden. Spiele, bei denen alle Mitspieler Mitglieder derselben Gruppe sind, werden automatisch in der Gruppenstatistik erfasst.")
+
+    with st.expander("➕ Neue Gruppe erstellen"):
+        new_group_name = st.text_input("Gruppenname", key="new_group_name_input")
+        if st.button("Gruppe erstellen", key="create_group_btn"):
+            if new_group_name.strip():
+                new_gid = create_group(new_group_name.strip(), user_id)
+                st.success(f"Gruppe '{new_group_name.strip()}' erstellt.")
+                st.session_state["expand_group_" + str(new_gid)] = True
+                st.rerun()
+            else:
+                st.warning("Bitte einen Gruppennamen eingeben.")
+
+    my_groups_df = get_my_groups(user_id)
+    if my_groups_df.empty:
+        st.caption("Du bist noch in keiner Gruppe.")
+    else:
+        friends_for_invite_df = get_friends(user_id)
+        for _, grp in my_groups_df.iterrows():
+            gid = int(grp["id"])
+            with st.expander(f"👥 {grp['name']}"):
+                members_df = get_group_members(gid)
+                st.markdown("**Mitglieder:** " + ", ".join(members_df["display_name"].tolist()))
+
+                invitable_friends = friends_for_invite_df.loc[~friends_for_invite_df["id"].isin(members_df["id"])]
+                if not invitable_friends.empty:
+                    invite_name = st.selectbox("Freund einladen", invitable_friends["display_name"].tolist(), key=f"group_invite_select_{gid}")
+                    if st.button("Einladen", key=f"group_invite_btn_{gid}"):
+                        invite_uid = int(invitable_friends.loc[invitable_friends["display_name"] == invite_name, "id"].iloc[0])
+                        if invite_to_group(gid, invite_uid, user_id):
+                            st.success("Einladung gesendet.")
+                            st.rerun()
+                        else:
+                            st.warning("Diese Person wurde bereits eingeladen oder ist bereits Mitglied.")
+                else:
+                    st.caption("Alle deine Freunde sind bereits in dieser Gruppe oder du hast keine weiteren Freunde zum Einladen.")
+
 # --- TAB: Neues Spiel ---
 with tabs[2]:
     st.header("Neues Spiel erstellen")
@@ -1035,6 +1292,23 @@ with tabs[2]:
         remaining_friends = [n for n in friends_df["display_name"].tolist() if n not in team_a_friends]
         team_b_friends = st.multiselect("Freunde für Team B", remaining_friends, key="tb")
 
+        preview_ids = [user_id]
+        for name in team_a_friends:
+            preview_ids.append(int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0]))
+        for name in team_b_friends:
+            preview_ids.append(int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0]))
+
+        detected_groups_df = find_common_groups(preview_ids) if len(preview_ids) > 1 else pd.DataFrame(columns=["id", "name"])
+        selected_group_id = None
+        if not detected_groups_df.empty:
+            st.success(f"Alle ausgewählten Spieler sind gemeinsam in {'einer Gruppe' if len(detected_groups_df) == 1 else 'mehreren Gruppen'}. Das Spiel wird automatisch in der Gruppenstatistik erfasst.")
+            if len(detected_groups_df) == 1:
+                selected_group_id = int(detected_groups_df.iloc[0]["id"])
+                st.caption(f"Erkannte Gruppe: **{detected_groups_df.iloc[0]['name']}**")
+            else:
+                chosen_group_name = st.selectbox("Mehrere passende Gruppen erkannt – welche soll gezählt werden?", detected_groups_df["name"].tolist())
+                selected_group_id = int(detected_groups_df.loc[detected_groups_df["name"] == chosen_group_name, "id"].iloc[0])
+
         if st.button("Einladungen senden", type="primary"):
             if ruleset_id is None:
                 st.error("Bitte ein gültiges Regelwerk auswählen.")
@@ -1049,7 +1323,7 @@ with tabs[2]:
                 for name in team_b_friends:
                     uid = int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0])
                     invite_assignments[uid] = "B"
-                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip(), match_notizen.strip())
+                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip(), match_notizen.strip(), selected_group_id)
                 st.success("Spiel erstellt und Einladungen versendet!")
                 st.rerun()
 
@@ -1100,9 +1374,11 @@ with tabs[2]:
 # --- TAB: Einladungen ---
 with tabs[3]:
     st.header("Meine Einladungen")
+
+    st.subheader("Spiel-Einladungen")
     invites_df = get_pending_invites(user_id)
     if invites_df.empty:
-        st.info("Keine offenen Einladungen.")
+        st.info("Keine offenen Spiel-Einladungen.")
     else:
         for _, inv in invites_df.iterrows():
             c1, c2, c3 = st.columns([3, 1, 1])
@@ -1115,6 +1391,25 @@ with tabs[3]:
             with c3:
                 if st.button("Ablehnen", key=f"inv_decline_{inv['invite_id']}"):
                     respond_invite(int(inv["invite_id"]), False)
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Gruppen-Einladungen")
+    group_invites_df = get_pending_group_invites(user_id)
+    if group_invites_df.empty:
+        st.info("Keine offenen Gruppen-Einladungen.")
+    else:
+        for _, ginv in group_invites_df.iterrows():
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                st.write(f"{ginv['invited_by_name']} lädt dich in die Gruppe **{ginv['group_name']}** ein")
+            with c2:
+                if st.button("Annehmen", key=f"ginv_accept_{ginv['invite_id']}"):
+                    respond_group_invite(int(ginv["invite_id"]), True)
+                    st.rerun()
+            with c3:
+                if st.button("Ablehnen", key=f"ginv_decline_{ginv['invite_id']}"):
+                    respond_group_invite(int(ginv["invite_id"]), False)
                     st.rerun()
 
 # --- TAB: Spiele ---
@@ -1156,7 +1451,7 @@ with tabs[4]:
 
 # --- TAB: Rangliste ---
 with tabs[5]:
-    st.header("Rangliste (du und deine Freunde)")
+    st.header("Rangliste (Gesamt)")
     stats_df = get_player_stats_for_friends(user_id)
     if stats_df.empty:
         st.info("Noch keine Statistiken vorhanden.")
@@ -1168,7 +1463,29 @@ with tabs[5]:
         st.dataframe(display_ranked, use_container_width=True, hide_index=True)
 
         st.divider()
-        st.subheader("Individuelle Statistiken ansehen")
+        st.header("Meine Gruppen")
+        my_groups_rangliste_df = get_my_groups(user_id)
+        group_stats_lookup = {}
+        if my_groups_rangliste_df.empty:
+            st.caption("Du bist noch in keiner Gruppe. Erstelle eine Gruppe im Tab 'Freunde'.")
+        else:
+            for _, grp in my_groups_rangliste_df.iterrows():
+                gid = int(grp["id"])
+                gname = grp["name"]
+                group_stats_df = get_group_player_stats(gid)
+                st.subheader(gname)
+                if group_stats_df.empty:
+                    st.caption("Noch keine abgeschlossenen Spiele in dieser Gruppe.")
+                else:
+                    group_ranked_df = group_stats_df.sort_values(by="Siegquote", ascending=False).reset_index(drop=True)
+                    group_ranked_df.insert(0, "Rang", group_ranked_df.index + 1)
+                    group_stats_lookup[gid] = group_ranked_df
+                    display_group_ranked = group_ranked_df.drop(columns=["id"]).copy()
+                    display_group_ranked["Siegquote"] = (display_group_ranked["Siegquote"] * 100).round(1).astype(str) + " %"
+                    st.dataframe(display_group_ranked, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.header("Individuelle Statistiken")
         selected_name = st.selectbox("Spieler auswählen", ranked_df["Spieler"].tolist(), key="rangliste_player_select")
         srow = ranked_df.loc[ranked_df["Spieler"] == selected_name].iloc[0]
         selected_uid = int(srow["id"])
@@ -1179,24 +1496,45 @@ with tabs[5]:
 
         st.divider()
         st.subheader(f"Entwicklung über die Zeit – {selected_name}")
-        st.caption("Verlauf der Siegquote und Trefferquote (kumuliert in %) über die gespielten Spiele.")
+        st.caption("Verlauf der Siegquote und Trefferquote (kumuliert in %) über die gespielten Spiele (Gesamt, grün/blau) sowie je Gruppe (andere Farben), sofern der Spieler dort Spiele hat.")
         history_df = get_match_history_for_player(selected_uid)
+
+        group_colors = ["#e67e22", "#8e44ad", "#c0392b", "#16a085", "#f1c40f", "#34495e"]
+        group_histories = []
+        if not my_groups_rangliste_df.empty:
+            for idx, grp in my_groups_rangliste_df.iterrows():
+                gid = int(grp["id"])
+                if gid in group_stats_lookup and selected_uid in group_stats_lookup[gid]["id"].values:
+                    ghist = get_group_match_history_for_player(gid, selected_uid)
+                    if not ghist.empty and len(ghist) >= 2:
+                        group_histories.append((grp["name"], ghist, group_colors[idx % len(group_colors)]))
+
         if history_df.empty or len(history_df) < 2:
             st.caption("Noch nicht genug abgeschlossene Spiele für eine Zeitverlaufs-Grafik (mindestens 2 nötig).")
         else:
             fig_sieg = go.Figure()
             fig_sieg.add_trace(go.Scatter(
                 x=history_df["Spielnummer"], y=history_df["Siegquote_Verlauf"],
-                mode="lines+markers", line=dict(color="#2e8b57"), name="Siegquote (%)"
+                mode="lines+markers", line=dict(color="#2e8b57"), name="Siegquote Gesamt (%)"
             ))
+            for gname, ghist, gcolor in group_histories:
+                fig_sieg.add_trace(go.Scatter(
+                    x=ghist["Spielnummer"], y=ghist["Siegquote_Verlauf"],
+                    mode="lines+markers", line=dict(color=gcolor), name=f"Siegquote {gname} (%)"
+                ))
             fig_sieg.update_layout(title="Siegquote im Verlauf", xaxis_title="Spielnummer", yaxis_title="Siegquote (%)", yaxis_range=[0, 100])
             st.plotly_chart(fig_sieg, use_container_width=True)
 
             fig_treffer = go.Figure()
             fig_treffer.add_trace(go.Scatter(
                 x=history_df["Spielnummer"], y=history_df["Trefferquote_Verlauf"],
-                mode="lines+markers", line=dict(color="#2980b9"), name="Trefferquote (%)"
+                mode="lines+markers", line=dict(color="#2980b9"), name="Trefferquote Gesamt (%)"
             ))
+            for gname, ghist, gcolor in group_histories:
+                fig_treffer.add_trace(go.Scatter(
+                    x=ghist["Spielnummer"], y=ghist["Trefferquote_Verlauf"],
+                    mode="lines+markers", line=dict(color=gcolor, dash="dot"), name=f"Trefferquote {gname} (%)"
+                ))
             fig_treffer.update_layout(title="Trefferquote im Verlauf", xaxis_title="Spielnummer", yaxis_title="Trefferquote (%)", yaxis_range=[0, 100])
             st.plotly_chart(fig_treffer, use_container_width=True)
 
@@ -1275,5 +1613,32 @@ if is_admin_user:
                         delete_match(int(am["id"]))
                         st.success(f"Spiel {am['id']} gelöscht.")
                         st.rerun()
+
+        st.divider()
+        st.subheader("Alle Gruppen (inkl. Mitglieder und Löschen)")
+        st.caption("Löscht eine Gruppe unwiderruflich inklusive aller Mitgliedschaften und Einladungen. Bereits gespielte Spiele bleiben erhalten, verlieren aber die Gruppenzuordnung.")
+        admin_groups = get_all_groups_for_admin()
+        if admin_groups.empty:
+            st.info("Keine Gruppen vorhanden.")
+        else:
+            for _, ag in admin_groups.iterrows():
+                gid = int(ag["id"])
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.write(f"**{ag['Gruppe']}** (Ersteller: {ag['Ersteller']}, Spiele: {int(ag['Spiele'])})")
+                    members_admin_df = get_group_members(gid)
+                    st.caption("Mitglieder: " + (", ".join(members_admin_df["display_name"].tolist()) if not members_admin_df.empty else "–"))
+                with c2:
+                    confirm_group_key = f"confirm_del_group_{gid}"
+                    if st.session_state.get(confirm_group_key, False):
+                        if st.button("Bestätigen", key=f"confirm_group_btn_{gid}", type="primary"):
+                            delete_group(gid)
+                            st.session_state[confirm_group_key] = False
+                            st.success(f"Gruppe '{ag['Gruppe']}' wurde gelöscht.")
+                            st.rerun()
+                    else:
+                        if st.button("Löschen", key=f"admin_del_group_{gid}"):
+                            st.session_state[confirm_group_key] = True
+                            st.rerun()
 
 st.session_state.last_seen_matches_total = current_matches_total
