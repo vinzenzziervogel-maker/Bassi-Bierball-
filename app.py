@@ -101,9 +101,11 @@ def init_db():
             team TEXT NOT NULL,
             treffer INTEGER,
             wuerfe INTEGER,
-            platzierung INTEGER
+            platzierung INTEGER,
+            strafrunden INTEGER
         )
     """)
+    c.execute("ALTER TABLE match_participants ADD COLUMN IF NOT EXISTS strafrunden INTEGER")
     c.execute("""
         CREATE TABLE IF NOT EXISTS remember_tokens (
             id SERIAL PRIMARY KEY,
@@ -582,7 +584,9 @@ def get_group_player_stats(group_id):
                    SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
+                   ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen' AND m.group_id = %s
             JOIN users u ON mp.user_id = u.id
@@ -654,8 +658,8 @@ def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", no
         )
         match_id = c.fetchone()[0]
         c.execute(
-            "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (%s,%s,%s,%s,%s,%s)",
-            (match_id, host_id, invite_assignments[host_id], None, None, None)
+            "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung, strafrunden) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (match_id, host_id, invite_assignments[host_id], None, None, None, None)
         )
         for uid, team in invite_assignments.items():
             if uid == host_id:
@@ -696,8 +700,8 @@ def respond_invite(invite_id, accept):
             match_id, user_id, team = row
             if accept:
                 c.execute(
-                    "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung) VALUES (%s,%s,%s,%s,%s,%s)",
-                    (match_id, user_id, team, None, None, None)
+                    "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung, strafrunden) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (match_id, user_id, team, None, None, None, None)
                 )
                 c.execute("UPDATE match_invites SET status = 'angenommen' WHERE id = %s", (invite_id,))
             else:
@@ -752,8 +756,8 @@ def finalize_match(match_id, winner, stats_by_participant_id):
         c.execute("UPDATE matches SET winner = %s, status = 'abgeschlossen' WHERE id = %s", (winner, match_id))
         for pid, stats in stats_by_participant_id.items():
             c.execute(
-                "UPDATE match_participants SET treffer = %s, wuerfe = %s, platzierung = %s WHERE id = %s",
-                (stats["treffer"], stats["wuerfe"], stats["platzierung"], pid)
+                "UPDATE match_participants SET treffer = %s, wuerfe = %s, platzierung = %s, strafrunden = %s WHERE id = %s",
+                (stats["treffer"], stats["wuerfe"], stats["platzierung"], stats.get("strafrunden"), pid)
             )
         conn.commit()
     finally:
@@ -777,7 +781,7 @@ def get_match_participants_view(match_id):
     conn = get_conn()
     try:
         df = pd.read_sql("""
-            SELECT mp.team AS "Team", u.display_name AS "Spieler", mp.treffer AS "Treffer", mp.wuerfe AS "Wuerfe"
+            SELECT mp.team AS "Team", u.display_name AS "Spieler", mp.treffer AS "Treffer", mp.wuerfe AS "Wuerfe", mp.strafrunden AS "Strafrunden"
             FROM match_participants mp JOIN users u ON mp.user_id = u.id
             WHERE mp.match_id = %s
             ORDER BY mp.team, u.display_name
@@ -807,7 +811,9 @@ def get_player_stats_for_friends(user_id):
                    SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
+                   ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
@@ -830,7 +836,9 @@ def get_stats_for_single_user(target_user_id):
                    SUM(CASE WHEN mp.team = m.winner THEN 1 ELSE 0 END) AS "Siege",
                    ROUND(AVG(mp.treffer), 2) AS "Ø Treffer",
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
-                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote"
+                   ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
+                   ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
@@ -904,7 +912,9 @@ def render_match_stats_table(participants_df, winner):
             quotes.append("–")
     display_df["Trefferquote"] = quotes
     display_df["Ergebnis"] = display_df["Team"].apply(lambda t: "Sieg" if t == winner else "Niederlage")
-    display_df = display_df[["Spieler", "Team", "Ergebnis", "Treffer", "Wuerfe", "Trefferquote"]]
+    if "Strafrunden" not in display_df.columns:
+        display_df["Strafrunden"] = None
+    display_df = display_df[["Spieler", "Team", "Ergebnis", "Treffer", "Wuerfe", "Trefferquote", "Strafrunden"]]
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 @st.cache_resource
@@ -1156,10 +1166,11 @@ with tabs[0]:
         st.info("Noch keine abgeschlossenen Spiele.")
     else:
         r = own_stats.iloc[0]
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Spiele", int(r["Spiele"]))
         c2.metric("Siegquote", f"{r['Siegquote']*100:.1f}%")
         c3.metric("Trefferquote", f"{r['Trefferquote']*100:.1f}%" if pd.notna(r["Trefferquote"]) else "–")
+        c4.metric("Strafrunden gesamt", int(r["Strafrunden Gesamt"]))
 
 # --- TAB: Freunde ---
 with tabs[1]:
@@ -1235,10 +1246,11 @@ with tabs[1]:
                     st.info("Dieser Nutzer hat noch keine abgeschlossenen Spiele.")
                 else:
                     fr_row = fstats.iloc[0]
-                    c1, c2, c3 = st.columns(3)
+                    c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Spiele", int(fr_row["Spiele"]))
                     c2.metric("Siegquote", f"{fr_row['Siegquote']*100:.1f}%")
                     c3.metric("Trefferquote", f"{fr_row['Trefferquote']*100:.1f}%" if pd.notna(fr_row["Trefferquote"]) else "–")
+                    c4.metric("Strafrunden gesamt", int(fr_row["Strafrunden Gesamt"]))
 
                 st.markdown("**Alle Spiele, an denen dieser Nutzer teilgenommen hat (zur Transparenz sichtbar für alle Freunde):**")
                 friend_matches = get_full_match_list_for_user(fid)
@@ -1409,12 +1421,14 @@ with tabs[2]:
 
                 stats_inputs = {}
                 for _, p in participants.iterrows():
-                    c1, c2 = st.columns(2)
+                    c1, c2, c3 = st.columns(3)
                     with c1:
                         treffer = st.number_input(f"Treffer – {p['Spieler']} (Team {p['Team']})", min_value=0, step=1, key=f"tr_{m['id']}_{p['id']}")
                     with c2:
                         wuerfe = st.number_input(f"Würfe – {p['Spieler']}", min_value=0, step=1, key=f"wu_{m['id']}_{p['id']}")
-                    stats_inputs[int(p["id"])] = {"treffer": treffer, "wuerfe": wuerfe, "platzierung": None}
+                    with c3:
+                        strafrunden = st.number_input(f"Strafrunden – {p['Spieler']}", min_value=0, step=1, key=f"sr_{m['id']}_{p['id']}")
+                    stats_inputs[int(p["id"])] = {"treffer": treffer, "wuerfe": wuerfe, "platzierung": None, "strafrunden": strafrunden}
 
                 if st.button("Spiel abschließen", key=f"finalize_{m['id']}"):
                     finalize_match(int(m["id"]), winner_code, stats_inputs)
@@ -1544,10 +1558,11 @@ with tabs[5]:
         selected_name = st.selectbox("Spieler auswählen", ranked_df["Spieler"].tolist(), key="rangliste_player_select")
         srow = ranked_df.loc[ranked_df["Spieler"] == selected_name].iloc[0]
         selected_uid = int(srow["id"])
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Spiele", int(srow["Spiele"]))
         c2.metric("Siegquote", f"{srow['Siegquote']*100:.1f}%")
         c3.metric("Trefferquote", f"{srow['Trefferquote']*100:.1f}%" if pd.notna(srow["Trefferquote"]) else "–")
+        c4.metric("Strafrunden gesamt", int(srow["Strafrunden Gesamt"]))
 
         st.divider()
         st.subheader(f"Entwicklung über die Zeit – {selected_name}")
