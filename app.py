@@ -780,8 +780,8 @@ st_autorefresh(interval=15000, key="live_refresh")
 
 st.sidebar.write(f"Angemeldet als **{display_name}**")
 
-APP_URL = os.environ.get("APP_URL", "https://bierball-league.onrender.com")
-SHARE_TEXT = "Spiele ranked Bierball mit der Bassozial Bierball App: " + APP_URL
+APP_URL = os.environ.get("APP_URL", "https://bierball-league-v2.onrender.com")
+SHARE_TEXT = "Spiele ranked Bierball und finde heraus, wer die wahre Nummer 1 ist mit der Bassi Bierball App: " + APP_URL
 
 share_html = f"""
 <div style="margin-bottom: 10px;">
@@ -862,9 +862,9 @@ tabs = st.tabs(tab_names)
 
 # --- TAB: Profil ---
 with tabs[0]:
-    st.header("Mein Profil")
     user_row = get_user(user_id)
     _, username, current_display_name = user_row
+    st.header(f"Mein Profil @{username}")
 
     with st.form("profile_form"):
         new_display_name = st.text_input("Anzeigename", value=current_display_name)
@@ -1064,8 +1064,12 @@ with tabs[2]:
             status_label = "bereit" if all_accepted else "warte auf Zusagen"
             ort_display = f" – {m['ort']}" if m.get("ort") else ""
             with st.expander(f"Spiel {m['id']} – {m['match_date']}{ort_display} ({m['regelwerk']}) ({status_label})"):
-                if m.get("notizen"):
-                    st.info(f"**Individuelle Zusatzregeln:** {m['notizen']}")
+                notizen_value_open = m.get("notizen")
+                has_notizen_open = pd.notna(notizen_value_open) and str(notizen_value_open).strip() != ""
+                if has_notizen_open:
+                    st.info(f"**Individuelle Zusatzregeln:** {str(notizen_value_open).strip()}")
+                else:
+                    st.caption(f"Regelwerk: {m['regelwerk']}")
                 st.dataframe(invite_status, use_container_width=True, hide_index=True)
 
                 participants = get_match_participants_for_completion(int(m["id"]))
@@ -1129,8 +1133,12 @@ with tabs[4]:
             with st.expander(title):
                 pdf = get_match_participants_view(int(m["id"]))
                 render_teams_vs(pdf)
-                if m.get("Notizen"):
-                    st.info(f"**Individuelle Zusatzregeln:** {m['Notizen']}")
+                notizen_value = m.get("Notizen")
+                has_notizen = pd.notna(notizen_value) and str(notizen_value).strip() != ""
+                if has_notizen:
+                    st.info(f"**Individuelle Zusatzregeln:** {str(notizen_value).strip()}")
+                else:
+                    st.caption(f"Regelwerk: {m['Regelwerk']}")
                 if m["Status"] == "einladung_offen":
                     render_running_match_names(pdf)
                 else:
