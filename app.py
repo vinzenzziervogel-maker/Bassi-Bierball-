@@ -5,18 +5,30 @@ import pandas as pd
 import hashlib
 import secrets
 import os
+import time
+import functools
 from datetime import date, datetime
 import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
+
 import streamlit.components.v1 as components
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_USERNAME = "469Vini"
 
-def get_conn():
+def get_conn(max_retries=3, retry_delay=0.4):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ist nicht gesetzt. Bitte als Umgebungsvariable in Render hinterlegen.")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+            conn.autocommit = False
+            return conn
+        except psycopg2.OperationalError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+    raise last_error
 
 def init_db():
     conn = get_conn()
@@ -138,6 +150,22 @@ def init_db():
         )
         conn.commit()
     conn.close()
+
+def retry_db_write(max_retries=3, retry_delay=0.4):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+            raise last_error
+        return wrapper
+    return decorator
 
 def hash_password(password, salt):
     return hashlib.sha256((salt + password).encode()).hexdigest()
@@ -372,6 +400,7 @@ def search_users(query, exclude_id):
         conn.close()
     return df
 
+@retry_db_write()
 def send_friend_request(user_id, friend_id):
     conn = get_conn()
     ok = True
@@ -389,6 +418,7 @@ def send_friend_request(user_id, friend_id):
         conn.close()
     return ok
 
+@retry_db_write()
 def respond_friend_request(request_id, accept):
     conn = get_conn()
     try:
@@ -466,6 +496,7 @@ def get_group_members(group_id):
         conn.close()
     return df
 
+@retry_db_write()
 def invite_to_group(group_id, user_id, invited_by):
     conn = get_conn()
     ok = True
@@ -501,6 +532,7 @@ def get_pending_group_invites(user_id):
         conn.close()
     return df
 
+@retry_db_write()
 def respond_group_invite(invite_id, accept):
     conn = get_conn()
     try:
@@ -611,6 +643,7 @@ def save_custom_ruleset(name, flags):
         conn.close()
     return ok
 
+@retry_db_write()
 def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen="", group_id=None):
     conn = get_conn()
     try:
@@ -652,6 +685,7 @@ def get_pending_invites(user_id):
         conn.close()
     return df
 
+@retry_db_write()
 def respond_invite(invite_id, accept):
     conn = get_conn()
     try:
@@ -710,6 +744,7 @@ def get_match_participants_for_completion(match_id):
         conn.close()
     return df
 
+@retry_db_write()
 def finalize_match(match_id, winner, stats_by_participant_id):
     conn = get_conn()
     try:
@@ -872,10 +907,26 @@ def render_match_stats_table(participants_df, winner):
     display_df = display_df[["Spieler", "Team", "Ergebnis", "Treffer", "Wuerfe", "Trefferquote"]]
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-try:
+@st.cache_resource
+def _run_init_db_once():
     init_db()
-except Exception as e:
-    st.error(f"Fehler bei der Datenbank-Initialisierung: {e}")
+    return True
+
+_init_db_ok = False
+_init_db_last_error = None
+for _init_attempt in range(3):
+    try:
+        _init_db_ok = _run_init_db_once()
+        break
+    except Exception as e:
+        _init_db_last_error = e
+        time.sleep(0.5 * (_init_attempt + 1))
+
+if not _init_db_ok:
+    st.error(f"Fehler bei der Datenbank-Initialisierung: {_init_db_last_error}")
+    if st.button("🔁 Erneut versuchen"):
+        st.cache_resource.clear()
+        st.rerun()
     st.stop()
 
 st.set_page_config(page_title="Bassi Bierball", layout="wide")
@@ -994,8 +1045,6 @@ if st.session_state.user is None:
 user_id = st.session_state.user["id"]
 display_name = st.session_state.user["display_name"]
 
-st_autorefresh(interval=15000, key="live_refresh")
-
 st.sidebar.write(f"Angemeldet als **{display_name}**")
 
 APP_URL = os.environ.get("APP_URL", "https://bierball-league-v2.onrender.com")
@@ -1056,7 +1105,13 @@ if st.sidebar.button("Abmelden"):
     st.session_state.user = None
     st.rerun()
 
-st.title("Bassi Bierball")
+title_col, refresh_col = st.columns([6, 1])
+with title_col:
+    st.title("Bassi Bierball")
+with refresh_col:
+    st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
+    if st.button("🔄 Aktualisieren", key="manual_refresh_btn", use_container_width=True):
+        st.rerun()
 
 pending_friend_count = len(get_pending_friend_requests(user_id))
 pending_invite_count = len(get_pending_invites(user_id)) + len(get_pending_group_invites(user_id))
