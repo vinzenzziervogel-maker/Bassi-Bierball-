@@ -382,6 +382,25 @@ def delete_user_account(target_user_id):
     finally:
         conn.close()
 
+def delete_user_account(target_user_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id FROM matches WHERE host_id = %s", (target_user_id,))
+        hosted_match_ids = [row[0] for row in c.fetchall()]
+        for mid in hosted_match_ids:
+            c.execute("DELETE FROM match_participants WHERE match_id = %s", (mid,))
+            c.execute("DELETE FROM match_invites WHERE match_id = %s", (mid,))
+        c.execute("DELETE FROM matches WHERE host_id = %s", (target_user_id,))
+        c.execute("DELETE FROM match_participants WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM match_invites WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM friendships WHERE user_id = %s OR friend_id = %s", (target_user_id, target_user_id))
+        c.execute("DELETE FROM remember_tokens WHERE user_id = %s", (target_user_id,))
+        c.execute("DELETE FROM users WHERE id = %s", (target_user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
 def update_profile(user_id, display_name):
     conn = get_conn()
     try:
@@ -1115,13 +1134,50 @@ if st.sidebar.button("Abmelden"):
     st.session_state.user = None
     st.rerun()
 
-title_col, refresh_col = st.columns([6, 1])
-with title_col:
-    st.title("Bassi Bierball")
-with refresh_col:
-    st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
-    if st.button("🔄 Aktualisieren", key="manual_refresh_btn", use_container_width=True):
-        st.rerun()
+BASSI_LOGO_BASE64 = "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"
+
+st.markdown(
+    """
+    <style>
+    .bassi-header-wrap {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 0.8rem;
+        flex-wrap: wrap;
+        margin-bottom: 0.5rem;
+    }
+    .bassi-header-wrap h1 {
+        font-size: 2.25rem;
+        margin: 0;
+        white-space: nowrap;
+    }
+    .bassi-header-logo {
+        height: auto;
+        width: min(320px, 100%);
+        max-width: 100%;
+    }
+    @media (max-width: 640px) {
+        .bassi-header-wrap {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.3rem;
+        }
+        .bassi-header-wrap h1 {
+            font-size: 1.8rem;
+        }
+        .bassi-header-logo {
+            width: min(280px, 100%);
+        }
+    }
+    </style>
+    """
+    + f'<div class="bassi-header-wrap"><img class="bassi-header-logo" src="data:image/png;base64,{BASSI_LOGO_BASE64}" /><h1>Bassi Bierball</h1></div>',
+    unsafe_allow_html=True
+)
+
+if st.button("🔄 Aktualisieren", key="manual_refresh_btn"):
+    st.rerun()
 
 pending_friend_count = len(get_pending_friend_requests(user_id))
 pending_invite_count = len(get_pending_invites(user_id)) + len(get_pending_group_invites(user_id))
@@ -1667,6 +1723,30 @@ if is_admin_user:
                     if st.button("Löschen", key=f"del_user_{target_uid}"):
                         st.session_state[confirm_key] = True
                         st.rerun()
+
+        st.divider()
+        st.subheader("Account löschen")
+        st.caption("Löscht den Nutzer-Account inklusive aller zugehörigen Spiele, Einladungen und Freundschaften unwiderruflich.")
+
+        deletable_users = users_overview[users_overview["username"] != ADMIN_USERNAME]
+        if deletable_users.empty:
+            st.caption("Keine löschbaren Accounts vorhanden.")
+        else:
+            options = deletable_users.apply(
+                lambda r: f"{r['display_name']} (@{r['username']}, ID {r['id']})", axis=1
+            ).tolist()
+            selected_option = st.selectbox("Nutzer auswählen", options, key="admin_delete_user_select")
+            selected_idx = options.index(selected_option)
+            selected_row = deletable_users.iloc[selected_idx]
+
+            confirm_delete = st.checkbox(
+                f"Ich bestätige, dass der Account '{selected_row['display_name']}' unwiderruflich gelöscht werden soll.",
+                key="admin_delete_confirm"
+            )
+            if st.button("Account endgültig löschen", key="admin_delete_user_btn", type="primary", disabled=not confirm_delete):
+                delete_user_account(int(selected_row["id"]))
+                st.success(f"Account '{selected_row['display_name']}' wurde gelöscht.")
+                st.rerun()
 
         st.divider()
         st.subheader("Alle Spiele (inkl. Löschen)")
