@@ -1141,33 +1141,29 @@ st.markdown(
     <style>
     .bassi-header-wrap {
         display: flex;
-        align-items: center;
+        flex-direction: column;
+        align-items: flex-start;
         justify-content: flex-start;
-        gap: 0.8rem;
-        flex-wrap: wrap;
+        gap: 0.3rem;
         margin-bottom: 0.5rem;
     }
     .bassi-header-wrap h1 {
         font-size: 2.25rem;
         margin: 0;
         white-space: nowrap;
+        text-align: left;
     }
     .bassi-header-logo {
         height: auto;
-        width: min(320px, 100%);
+        width: min(256px, 100%);
         max-width: 100%;
     }
     @media (max-width: 640px) {
-        .bassi-header-wrap {
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.3rem;
-        }
         .bassi-header-wrap h1 {
             font-size: 1.8rem;
         }
         .bassi-header-logo {
-            width: min(280px, 100%);
+            width: min(224px, 100%);
         }
     }
     </style>
