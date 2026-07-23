@@ -1,4 +1,5 @@
 import math
+import random
 import streamlit as st
 import psycopg2
 import psycopg2.extras
@@ -1037,30 +1038,20 @@ def get_latest_completed_match_result_for_user(uid):
 
 def render_ranking_info_popover(key_suffix=""):
     with st.popover("ℹ️ Wie wird das Ranking berechnet?", use_container_width=False):
-        st.markdown(
-            """
-**Hauptkriterium: Wilson Score**
-
-Die Rangliste wird primär nach dem sogenannten *Wilson Score Lower Bound* sortiert – nicht nach der reinen Siegquote.
-Diese Methode berücksichtigt automatisch, wie viele Spiele gespielt wurden, und verhindert, dass z.B. ein Spieler
-mit 1 Sieg aus 1 Spiel (100%) einen Spieler mit 9 Siegen aus 10 Spielen (90%) im Ranking überholt.
-
-Formel:
-"""
-        )
+        st.markdown("**Hauptkriterium: Wilson Score**")
+        st.markdown("Die Rangliste wird nach dem Wilson Score Lower Bound sortiert:")
         st.latex(r"W = \frac{\hat{p} + \frac{z^2}{2n} - z\sqrt{\frac{\hat{p}(1-\hat{p})}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}}")
         st.markdown(
             r"""
-Dabei ist \(\hat{p}\) die Siegquote (Siege/Spiele), \(n\) die Anzahl gespielter Partien und \(z = 1.96\)
-(entspricht 95% statistischer Konfidenz). Mehr gespielte und gewonnene Partien führen zu einem höheren,
-verlässlicheren Score – wenige Spiele werden vorsichtiger bewertet.
+\(\hat{p}\) = Siegquote, \(n\) = Anzahl Spiele, \(z = 1{,}96\) (95% Konfidenz)
 
-**Tiebreaker bei exakt gleichem Wilson Score**
+Dieser berücksichtigt neben der Siegesquote auch die Anzahl gespielter Spiele und verhindert, dass jemand aufhört an Spielen teilzunehmen, um eine gute Quote zu schützen.
 
-Nur wenn zwei Spieler einen identischen Wilson Score haben, entscheidet ein zweites Kriterium, das zu
-**50% aus der Trefferquote** und zu **50% aus der Strafrundenquote** (invertiert, d.h. niedriger ist besser)
-zusammengesetzt ist. Eine hohe Trefferquote und eine niedrige Strafrundenquote verschaffen in diesem Fall
-den besseren Platz.
+Mehr Bierball = Mehr Gut
+
+**Tiebreaker bei gleichem Score**
+
+Bei identischem Wilson-Score entscheiden Trefferquote und Strafrundenquote gleichwertig über die Platzierung.
             """
         )
 
@@ -1614,9 +1605,42 @@ with tabs[2]:
         ).drop_duplicates(subset=["id"]) if not direct_add_df.empty else friends_df[["id", "display_name"]]
 
         st.divider()
+        st.subheader("🎲 Teams zufällig auslosen (optional)")
+        st.caption("Wähle alle Spieler aus, die am Spiel teilnehmen. Bei Klick auf den Button werden sie zufällig und möglichst gleichmäßig auf Team A und Team B verteilt. Bei ungerader Spielerzahl erhält ein Team einen Spieler mehr.")
+
+        draw_pool_options = [f"Ich ({display_name})"] + all_addable_names
+        draw_selection = st.multiselect("Teilnehmer für die Auslosung auswählen", draw_pool_options, key="draw_pool")
+
+        if st.button("🎲 Zufällig auf die Teams verteilen"):
+            if len(draw_selection) < 2:
+                st.warning("Bitte mindestens 2 Teilnehmer für die Auslosung auswählen.")
+            else:
+                shuffled = draw_selection.copy()
+                random.shuffle(shuffled)
+                half = len(shuffled) // 2
+                if len(shuffled) % 2 == 0:
+                    drawn_a = shuffled[:half]
+                    drawn_b = shuffled[half:]
+                else:
+                    if random.random() < 0.5:
+                        drawn_a = shuffled[:half + 1]
+                        drawn_b = shuffled[half + 1:]
+                    else:
+                        drawn_a = shuffled[:half]
+                        drawn_b = shuffled[half:]
+
+                host_label = f"Ich ({display_name})"
+                host_in_a = host_label in drawn_a
+                st.session_state["ta"] = [n for n in drawn_a if n != host_label]
+                st.session_state["tb"] = [n for n in drawn_b if n != host_label]
+                st.session_state["host_in_team_a_checkbox"] = host_in_a
+                st.success(f"Teams ausgelost: Team A = {len(drawn_a)} Spieler, Team B = {len(drawn_b)} Spieler.")
+                st.rerun()
+
+        st.divider()
         st.subheader("Team A")
         team_a_friends = st.multiselect("Spieler für Team A", all_addable_names, key="ta")
-        host_in_team_a = st.checkbox("Ich spiele in Team A", value=True)
+        host_in_team_a = st.checkbox("Ich spiele in Team A", value=True, key="host_in_team_a_checkbox")
 
         st.subheader("Team B")
         remaining_friends = [n for n in all_addable_names if n not in team_a_friends]
