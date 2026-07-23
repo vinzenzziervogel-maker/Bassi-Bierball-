@@ -1,3 +1,4 @@
+import math
 import streamlit as st
 import psycopg2
 import psycopg2.extras
@@ -652,15 +653,32 @@ def get_group_match_history_for_player(group_id, user_id):
         df["Trefferquote_Verlauf"] = (df["Kum_Treffer"] / df["Kum_Wuerfe"].replace(0, pd.NA) * 100).round(1)
     return df
 
+def wilson_lower_bound(wins, n, z=1.96):
+    if n is None or n == 0 or pd.isna(n):
+        return 0.0
+    wins = 0 if pd.isna(wins) else wins
+    p = wins / n
+    denom = 1 + (z ** 2) / n
+    center = p + (z ** 2) / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) / n) + (z ** 2) / (4 * n ** 2))
+    return (center - margin) / denom
+
 def apply_ranking_sort(df):
     df = df.copy()
+    df["_wilson_score"] = df.apply(lambda r: wilson_lower_bound(r["Siege"], r["Spiele"]), axis=1).round(6)
+
     treffer_q = df["Trefferquote"].fillna(0)
-    strafr_q = df["Strafrundenquote"].fillna(0) if "Strafrundenquote" in df.columns else pd.Series([0]*len(df))
+    strafr_q = df["Strafrundenquote"].fillna(0) if "Strafrundenquote" in df.columns else pd.Series([0] * len(df))
     max_strafr = strafr_q.max() if strafr_q.max() > 0 else 1
     strafr_score = 1 - (strafr_q / max_strafr)
-    df["_ranking_score"] = (treffer_q.rank(pct=True) * 0.5) + (strafr_score.rank(pct=True) * 0.5)
-    df = df.sort_values(by=["Siegquote", "_ranking_score"], ascending=[False, False]).reset_index(drop=True)
-    df = df.drop(columns=["_ranking_score"])
+    df["_tiebreak_score"] = (treffer_q.rank(pct=True) * 0.5) + (strafr_score.rank(pct=True) * 0.5)
+
+    df = df.sort_values(
+        by=["_wilson_score", "_tiebreak_score"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    df = df.drop(columns=["_wilson_score", "_tiebreak_score"])
     return df
 
 @retry_db_write()
@@ -1016,6 +1034,35 @@ def get_latest_completed_match_result_for_user(uid):
         return None
     row = df.iloc[0]
     return {"match_id": int(row["match_id"]), "is_winner": row["team"] == row["winner"]}
+
+def render_ranking_info_popover(key_suffix=""):
+    with st.popover("ℹ️ Wie wird das Ranking berechnet?", use_container_width=False):
+        st.markdown(
+            """
+**Hauptkriterium: Wilson Score**
+
+Die Rangliste wird primär nach dem sogenannten *Wilson Score Lower Bound* sortiert – nicht nach der reinen Siegquote.
+Diese Methode berücksichtigt automatisch, wie viele Spiele gespielt wurden, und verhindert, dass z.B. ein Spieler
+mit 1 Sieg aus 1 Spiel (100%) einen Spieler mit 9 Siegen aus 10 Spielen (90%) im Ranking überholt.
+
+Formel:
+"""
+        )
+        st.latex(r"W = \frac{\hat{p} + \frac{z^2}{2n} - z\sqrt{\frac{\hat{p}(1-\hat{p})}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}}")
+        st.markdown(
+            r"""
+Dabei ist \(\hat{p}\) die Siegquote (Siege/Spiele), \(n\) die Anzahl gespielter Partien und \(z = 1.96\)
+(entspricht 95% statistischer Konfidenz). Mehr gespielte und gewonnene Partien führen zu einem höheren,
+verlässlicheren Score – wenige Spiele werden vorsichtiger bewertet.
+
+**Tiebreaker bei exakt gleichem Wilson Score**
+
+Nur wenn zwei Spieler einen identischen Wilson Score haben, entscheidet ein zweites Kriterium, das zu
+**50% aus der Trefferquote** und zu **50% aus der Strafrundenquote** (invertiert, d.h. niedriger ist besser)
+zusammengesetzt ist. Eine hohe Trefferquote und eine niedrige Strafrundenquote verschaffen in diesem Fall
+den besseren Platz.
+            """
+        )
 
 def render_teams_vs(participants_df):
     team_a_names = participants_df.loc[participants_df["Team"] == "A", "Spieler"].tolist()
@@ -1784,7 +1831,13 @@ with tabs[4]:
 
 # --- TAB: Rangliste ---
 with tabs[5]:
-    st.header("Rangliste (Gesamt)")
+    header_col1, header_col2 = st.columns([5, 1])
+    with header_col1:
+        st.header("Rangliste (Gesamt)")
+    with header_col2:
+        st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+        render_ranking_info_popover(key_suffix="gesamt")
+
     stats_df = get_player_stats_for_friends(user_id)
     if stats_df.empty:
         st.info("Noch keine Statistiken vorhanden.")
@@ -1806,7 +1859,12 @@ with tabs[5]:
                 gid = int(grp["id"])
                 gname = grp["name"]
                 group_stats_df = get_group_player_stats(gid)
-                st.subheader(gname)
+                gh_col1, gh_col2 = st.columns([5, 1])
+                with gh_col1:
+                    st.subheader(gname)
+                with gh_col2:
+                    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+                    render_ranking_info_popover(key_suffix=f"group_{gid}")
                 if group_stats_df.empty:
                     st.caption("Noch keine abgeschlossenen Spiele in dieser Gruppe.")
                 else:
