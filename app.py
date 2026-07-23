@@ -144,6 +144,16 @@ def init_db():
     c.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id)")
     conn.commit()
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS temp_play_permissions (
+            id SERIAL PRIMARY KEY,
+            granter_id INTEGER NOT NULL REFERENCES users(id),
+            grantee_id INTEGER NOT NULL REFERENCES users(id),
+            expires_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
     c.execute("SELECT COUNT(*) FROM rulesets")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -605,17 +615,18 @@ def get_group_player_stats(group_id):
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
                    ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
                    ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
-                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt",
+                   ROUND(SUM(mp.strafrunden) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Strafrundenquote"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen' AND m.group_id = %s
             JOIN users u ON mp.user_id = u.id
             GROUP BY u.id, u.display_name
-            ORDER BY "Siege" DESC, "Trefferquote" DESC
         """, conn, params=(group_id,))
     finally:
         conn.close()
     if not df.empty:
         df["Siegquote"] = (df["Siege"] / df["Spiele"]).round(3)
+        df = apply_ranking_sort(df)
     return df
 
 def get_group_match_history_for_player(group_id, user_id):
@@ -640,6 +651,76 @@ def get_group_match_history_for_player(group_id, user_id):
         df["Kum_Wuerfe"] = df["Wuerfe"].cumsum()
         df["Trefferquote_Verlauf"] = (df["Kum_Treffer"] / df["Kum_Wuerfe"].replace(0, pd.NA) * 100).round(1)
     return df
+
+def apply_ranking_sort(df):
+    df = df.copy()
+    treffer_q = df["Trefferquote"].fillna(0)
+    strafr_q = df["Strafrundenquote"].fillna(0) if "Strafrundenquote" in df.columns else pd.Series([0]*len(df))
+    max_strafr = strafr_q.max() if strafr_q.max() > 0 else 1
+    strafr_score = 1 - (strafr_q / max_strafr)
+    df["_ranking_score"] = (treffer_q.rank(pct=True) * 0.5) + (strafr_score.rank(pct=True) * 0.5)
+    df = df.sort_values(by=["Siegquote", "_ranking_score"], ascending=[False, False]).reset_index(drop=True)
+    df = df.drop(columns=["_ranking_score"])
+    return df
+
+@retry_db_write()
+def grant_temp_play_permission(granter_id, grantee_id, hours):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        expires_at = datetime.now() + pd.Timedelta(hours=hours)
+        c.execute(
+            "INSERT INTO temp_play_permissions (granter_id, grantee_id, expires_at) VALUES (%s,%s,%s)",
+            (granter_id, grantee_id, str(expires_at))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_active_temp_permissions_granted(granter_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT tpp.id, u.id AS grantee_id, u.display_name, u.username, tpp.expires_at
+            FROM temp_play_permissions tpp
+            JOIN users u ON tpp.grantee_id = u.id
+            WHERE tpp.granter_id = %s AND tpp.expires_at > %s
+            ORDER BY tpp.expires_at DESC
+        """, conn, params=(granter_id, str(datetime.now())))
+    finally:
+        conn.close()
+    return df
+
+def get_players_addable_without_invite(host_id):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT u.id, u.display_name, u.username
+            FROM temp_play_permissions tpp
+            JOIN users u ON tpp.granter_id = u.id
+            WHERE tpp.grantee_id = %s AND tpp.expires_at > %s
+        """, conn, params=(host_id, str(datetime.now())))
+    finally:
+        conn.close()
+    return df
+
+def revoke_temp_permission(permission_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM temp_play_permissions WHERE id = %s", (permission_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def cleanup_expired_temp_permissions():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM temp_play_permissions WHERE expires_at <= %s", (str(datetime.now()),))
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_rulesets():
     conn = get_conn()
@@ -667,7 +748,9 @@ def save_custom_ruleset(name, flags):
     return ok
 
 @retry_db_write()
-def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen="", group_id=None):
+def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", notizen="", group_id=None, direct_add_ids=None):
+    if direct_add_ids is None:
+        direct_add_ids = set()
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -683,10 +766,16 @@ def create_match(match_date, ruleset_id, host_id, invite_assignments, ort="", no
         for uid, team in invite_assignments.items():
             if uid == host_id:
                 continue
-            c.execute(
-                "INSERT INTO match_invites (match_id, user_id, team, status) VALUES (%s,%s,%s,%s)",
-                (match_id, uid, team, "ausstehend")
-            )
+            if uid in direct_add_ids:
+                c.execute(
+                    "INSERT INTO match_participants (match_id, user_id, team, treffer, wuerfe, platzierung, strafrunden) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (match_id, uid, team, None, None, None, None)
+                )
+            else:
+                c.execute(
+                    "INSERT INTO match_invites (match_id, user_id, team, status) VALUES (%s,%s,%s,%s)",
+                    (match_id, uid, team, "ausstehend")
+                )
         conn.commit()
     finally:
         conn.close()
@@ -832,18 +921,19 @@ def get_player_stats_for_friends(user_id):
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
                    ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
                    ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
-                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt",
+                   ROUND(SUM(mp.strafrunden) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Strafrundenquote"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
             WHERE u.id = ANY(%s)
             GROUP BY u.id, u.display_name
-            ORDER BY "Siege" DESC, "Trefferquote" DESC
         """, conn, params=(friend_ids,))
     finally:
         conn.close()
     if not df.empty:
         df["Siegquote"] = (df["Siege"] / df["Spiele"]).round(3)
+        df = apply_ranking_sort(df)
     return df
 
 def get_stats_for_single_user(target_user_id):
@@ -908,6 +998,24 @@ def get_full_match_list_for_user(target_user_id):
     finally:
         conn.close()
     return df
+
+def get_latest_completed_match_result_for_user(uid):
+    conn = get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT m.id AS match_id, mp.team, m.winner
+            FROM match_participants mp
+            JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
+            WHERE mp.user_id = %s
+            ORDER BY m.match_date DESC, m.id DESC
+            LIMIT 1
+        """, conn, params=(uid,))
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {"match_id": int(row["match_id"]), "is_winner": row["team"] == row["winner"]}
 
 def render_teams_vs(participants_df):
     team_a_names = participants_df.loc[participants_df["Team"] == "A", "Spieler"].tolist()
@@ -1276,6 +1384,22 @@ with tabs[1]:
                     st.rerun()
 
     st.divider()
+    st.subheader("Von mir erteilte temporäre Zugriffe")
+    cleanup_expired_temp_permissions()
+    active_grants = get_active_temp_permissions_granted(user_id)
+    if active_grants.empty:
+        st.caption("Keine aktiven temporären Zugriffe erteilt.")
+    else:
+        for _, g in active_grants.iterrows():
+            gc1, gc2 = st.columns([4, 1])
+            with gc1:
+                st.write(f"**{g['display_name']}** (@{g['username']}) – gültig bis {g['expires_at']}")
+            with gc2:
+                if st.button("Entziehen", key=f"revoke_{g['id']}"):
+                    revoke_temp_permission(int(g["id"]))
+                    st.rerun()
+
+    st.divider()
     st.subheader("Meine Freunde")
     friends_df = get_friends(user_id)
     if friends_df.empty:
@@ -1285,13 +1409,33 @@ with tabs[1]:
             st.session_state.selected_friend_id = None
 
         for _, fr in friends_df.iterrows():
-            c1, c2 = st.columns([3, 1])
+            c1, c2, c3 = st.columns([3, 1, 1])
             with c1:
                 st.write(f"**{fr['display_name']}** (@{fr['username']})")
             with c2:
                 if st.button("Profil ansehen", key=f"view_friend_{fr['id']}"):
                     st.session_state.selected_friend_id = int(fr["id"])
                     st.rerun()
+            with c3:
+                if st.button("⚡ Zugriff geben", key=f"grant_temp_{fr['id']}"):
+                    st.session_state[f"show_grant_{fr['id']}"] = True
+
+            if st.session_state.get(f"show_grant_{fr['id']}", False):
+                gc1, gc2 = st.columns([2, 1])
+                with gc1:
+                    hours_choice = st.selectbox(
+                        f"Temporären Zugriff für {fr['display_name']} gewähren",
+                        [1, 6, 24],
+                        format_func=lambda h: f"{h} Stunde{'n' if h != 1 else ''}",
+                        key=f"hours_select_{fr['id']}"
+                    )
+                with gc2:
+                    st.markdown("<div style='height:1.6rem;'></div>", unsafe_allow_html=True)
+                    if st.button("Bestätigen", key=f"confirm_grant_{fr['id']}"):
+                        grant_temp_play_permission(user_id, int(fr["id"]), hours_choice)
+                        st.session_state[f"show_grant_{fr['id']}"] = False
+                        st.success(f"{fr['display_name']} kann dich jetzt {hours_choice}h ohne Einladung zu Spielen hinzufügen.")
+                        st.rerun()
 
         if st.session_state.selected_friend_id is not None:
             fid = st.session_state.selected_friend_id
@@ -1412,20 +1556,30 @@ with tabs[2]:
             placeholder="z.B. Sonderregeln, Ausnahmen oder Absprachen für dieses Spiel..."
         )
 
+        direct_add_df = get_players_addable_without_invite(user_id)
+        direct_add_names = direct_add_df["display_name"].tolist() if not direct_add_df.empty else []
+        if direct_add_names:
+            st.caption(f"⚡ Direkt hinzufügbar (temporäre Berechtigung, keine Einladung nötig): {', '.join(direct_add_names)}")
+
+        all_addable_names = friends_df["display_name"].tolist() + [n for n in direct_add_names if n not in friends_df["display_name"].tolist()]
+        combined_lookup_df = pd.concat(
+            [friends_df[["id", "display_name"]], direct_add_df[["id", "display_name"]]], ignore_index=True
+        ).drop_duplicates(subset=["id"]) if not direct_add_df.empty else friends_df[["id", "display_name"]]
+
         st.divider()
         st.subheader("Team A")
-        team_a_friends = st.multiselect("Freunde für Team A", friends_df["display_name"].tolist(), key="ta")
+        team_a_friends = st.multiselect("Spieler für Team A", all_addable_names, key="ta")
         host_in_team_a = st.checkbox("Ich spiele in Team A", value=True)
 
         st.subheader("Team B")
-        remaining_friends = [n for n in friends_df["display_name"].tolist() if n not in team_a_friends]
-        team_b_friends = st.multiselect("Freunde für Team B", remaining_friends, key="tb")
+        remaining_friends = [n for n in all_addable_names if n not in team_a_friends]
+        team_b_friends = st.multiselect("Spieler für Team B", remaining_friends, key="tb")
 
         preview_ids = [user_id]
         for name in team_a_friends:
-            preview_ids.append(int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0]))
+            preview_ids.append(int(combined_lookup_df.loc[combined_lookup_df["display_name"] == name, "id"].iloc[0]))
         for name in team_b_friends:
-            preview_ids.append(int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0]))
+            preview_ids.append(int(combined_lookup_df.loc[combined_lookup_df["display_name"] == name, "id"].iloc[0]))
 
         detected_groups_df = find_common_groups(preview_ids) if len(preview_ids) > 1 else pd.DataFrame(columns=["id", "name"])
         selected_group_id = None
@@ -1438,22 +1592,27 @@ with tabs[2]:
                 chosen_group_name = st.selectbox("Mehrere passende Gruppen erkannt – welche soll gezählt werden?", detected_groups_df["name"].tolist())
                 selected_group_id = int(detected_groups_df.loc[detected_groups_df["name"] == chosen_group_name, "id"].iloc[0])
 
-        if st.button("Einladungen senden", type="primary"):
+        if st.button("Spiel erstellen", type="primary"):
             if ruleset_id is None:
                 st.error("Bitte ein gültiges Regelwerk auswählen.")
             elif not team_a_friends and not team_b_friends:
-                st.error("Bitte mindestens einen Freund einladen.")
+                st.error("Bitte mindestens einen Spieler hinzufügen.")
             else:
                 invite_assignments = {}
+                direct_add_ids = set()
                 invite_assignments[user_id] = "A" if host_in_team_a else "B"
                 for name in team_a_friends:
-                    uid = int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0])
+                    uid = int(combined_lookup_df.loc[combined_lookup_df["display_name"] == name, "id"].iloc[0])
                     invite_assignments[uid] = "A"
+                    if name in direct_add_names:
+                        direct_add_ids.add(uid)
                 for name in team_b_friends:
-                    uid = int(friends_df.loc[friends_df["display_name"] == name, "id"].iloc[0])
+                    uid = int(combined_lookup_df.loc[combined_lookup_df["display_name"] == name, "id"].iloc[0])
                     invite_assignments[uid] = "B"
-                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip(), match_notizen.strip(), selected_group_id)
-                st.success("Spiel erstellt und Einladungen versendet!")
+                    if name in direct_add_names:
+                        direct_add_ids.add(uid)
+                create_match(match_date, ruleset_id, user_id, invite_assignments, match_ort.strip(), match_notizen.strip(), selected_group_id, direct_add_ids)
+                st.success("Spiel erstellt! Direkt hinzugefügte Spieler nehmen ohne Einladung teil, andere erhalten eine Einladung.")
                 st.rerun()
 
     st.divider()
@@ -1478,8 +1637,12 @@ with tabs[2]:
 
                 participants = get_match_participants_for_completion(int(m["id"]))
                 st.markdown("**Ergebnis eintragen und Spiel abschließen:**")
-                winner_choice = st.radio("Gewinner", ["Team A", "Team B"], key=f"winner_{m['id']}", horizontal=True)
-                winner_code = "A" if winner_choice == "Team A" else "B"
+                winner_choice = st.radio(
+                    "Gewinner (Pflichtauswahl)",
+                    ["– Bitte auswählen –", "Team A", "Team B"],
+                    key=f"winner_{m['id']}",
+                    horizontal=True
+                )
 
                 stats_inputs = {}
                 for _, p in participants.iterrows():
@@ -1493,14 +1656,20 @@ with tabs[2]:
                     stats_inputs[int(p["id"])] = {"treffer": treffer, "wuerfe": wuerfe, "platzierung": None, "strafrunden": strafrunden}
 
                 if st.button("Spiel abschließen", key=f"finalize_{m['id']}"):
-                    finalize_match(int(m["id"]), winner_code, stats_inputs)
-                    st.success("Spiel abgeschlossen!")
-                    st.rerun()
+                    if winner_choice == "– Bitte auswählen –":
+                        st.error("Bitte wähle zuerst das Gewinner-Team aus, bevor du das Spiel abschließt.")
+                    else:
+                        winner_code = "A" if winner_choice == "Team A" else "B"
+                        finalize_match(int(m["id"]), winner_code, stats_inputs)
+                        st.session_state["show_result_banner"] = True
+                        st.success("Spiel abgeschlossen!")
+                        st.rerun()
 
-                if st.button("Spiel löschen", key=f"delete_open_{m['id']}"):
-                    delete_match(int(m["id"]))
-                    st.success("Spiel gelöscht.")
-                    st.rerun()
+                if is_admin_user:
+                    if st.button("Spiel löschen (Admin)", key=f"delete_open_{m['id']}"):
+                        delete_match(int(m["id"]))
+                        st.success("Spiel gelöscht.")
+                        st.rerun()
 
 # --- TAB: Einladungen ---
 with tabs[3]:
@@ -1546,6 +1715,41 @@ with tabs[3]:
 # --- TAB: Spiele ---
 with tabs[4]:
     st.header("Spiele")
+
+    if "spiele_tab_last_seen_match" not in st.session_state:
+        st.session_state["spiele_tab_last_seen_match"] = None
+    if "spiele_tab_banner_dismissed" not in st.session_state:
+        st.session_state["spiele_tab_banner_dismissed"] = False
+
+    _latest_result = get_latest_completed_match_result_for_user(user_id)
+    if _latest_result is not None:
+        if st.session_state["spiele_tab_last_seen_match"] != _latest_result["match_id"]:
+            st.session_state["spiele_tab_last_seen_match"] = _latest_result["match_id"]
+            st.session_state["spiele_tab_banner_dismissed"] = False
+
+        if not st.session_state["spiele_tab_banner_dismissed"]:
+            if _latest_result["is_winner"]:
+                banner_html = """
+                <div id="bassi-result-banner" style="text-align:center; padding: 1.5rem 0;">
+                    <h1 style="color:#22c55e; font-size:3rem; margin-bottom:0.5rem;">Gewinner</h1>
+                    <img src="https://i.giphy.com/media/v1.Y2lkPTc5MGI3NjExN2d4M3YxY3p0M2JscDlqNWZ6OHJqNHVxZnB5MzB2ZXRsNWR0eHNidCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/V6vYGxjArFFde/giphy.gif"
+                         style="max-width: 320px; width: 90%; border-radius: 12px;" />
+                </div>
+                """
+            else:
+                banner_html = """
+                <div id="bassi-result-banner" style="text-align:center; padding: 1.5rem 0;">
+                    <h1 style="color:#ef4444; font-size:3rem; margin-bottom:0.5rem;">Loser</h1>
+                    <img src="https://i.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3JqOXoxcjd1YW1jNGxqcGg3OWhwZnF6NDA3YndqeHF2Nm43Z2VjdSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/7fF2Cc85jFZSZRHbyQ/giphy.gif"
+                         style="max-width: 320px; width: 90%; border-radius: 12px;" />
+                </div>
+                """
+            st.markdown(banner_html, unsafe_allow_html=True)
+            if st.button("Ausblenden", key="dismiss_result_banner"):
+                st.session_state["spiele_tab_banner_dismissed"] = True
+                st.rerun()
+            st.divider()
+
     if all_matches_feed.empty:
         st.info("Noch keine Spiele vorhanden.")
     else:
@@ -1572,10 +1776,8 @@ with tabs[4]:
                     st.markdown("<br>", unsafe_allow_html=True)
                     render_match_stats_table(pdf, m["Gewinner"])
 
-                is_host = (int(m["HostId"]) == user_id)
-                if is_host or is_admin_user:
-                    delete_label = "Dieses Spiel löschen" if is_host else "Dieses Spiel löschen (Admin)"
-                    if st.button(delete_label, key=f"del_hist_{m['id']}"):
+                if is_admin_user:
+                    if st.button("Dieses Spiel löschen (Admin)", key=f"del_hist_{m['id']}"):
                         delete_match(int(m["id"]))
                         st.success("Spiel gelöscht.")
                         st.rerun()
@@ -1587,7 +1789,7 @@ with tabs[5]:
     if stats_df.empty:
         st.info("Noch keine Statistiken vorhanden.")
     else:
-        ranked_df = stats_df.sort_values(by="Siegquote", ascending=False).reset_index(drop=True)
+        ranked_df = stats_df.reset_index(drop=True)
         ranked_df.insert(0, "Rang", ranked_df.index + 1)
         display_ranked = ranked_df.drop(columns=["id"]).copy()
         display_ranked["Siegquote"] = (display_ranked["Siegquote"] * 100).round(1).astype(str) + " %"
@@ -1608,7 +1810,7 @@ with tabs[5]:
                 if group_stats_df.empty:
                     st.caption("Noch keine abgeschlossenen Spiele in dieser Gruppe.")
                 else:
-                    group_ranked_df = group_stats_df.sort_values(by="Siegquote", ascending=False).reset_index(drop=True)
+                    group_ranked_df = group_stats_df.reset_index(drop=True)
                     group_ranked_df.insert(0, "Rang", group_ranked_df.index + 1)
                     group_stats_lookup[gid] = group_ranked_df
                     display_group_ranked = group_ranked_df.drop(columns=["id"]).copy()
