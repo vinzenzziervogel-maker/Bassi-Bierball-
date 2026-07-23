@@ -632,8 +632,7 @@ def get_group_player_stats(group_id):
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
                    ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
                    ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
-                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt",
-                   ROUND(SUM(mp.strafrunden) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Strafrundenquote"
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen' AND m.group_id = %s
             JOIN users u ON mp.user_id = u.id
@@ -733,9 +732,9 @@ def apply_ranking_sort(df):
     df["_wilson_score"] = df.apply(lambda r: wilson_lower_bound(r["Siege"], r["Spiele"]), axis=1).round(6)
 
     treffer_q = df["Trefferquote"].fillna(0)
-    strafr_q = df["Strafrundenquote"].fillna(0) if "Strafrundenquote" in df.columns else pd.Series([0] * len(df))
-    max_strafr = strafr_q.max() if strafr_q.max() > 0 else 1
-    strafr_score = 1 - (strafr_q / max_strafr)
+    strafr_avg = df["Ø Strafrunden"].fillna(0) if "Ø Strafrunden" in df.columns else pd.Series([0] * len(df))
+    max_strafr = strafr_avg.max() if strafr_avg.max() > 0 else 1
+    strafr_score = 1 - (strafr_avg / max_strafr)
     df["_tiebreak_score"] = (treffer_q.rank(pct=True) * 0.5) + (strafr_score.rank(pct=True) * 0.5)
 
     df = df.sort_values(
@@ -1004,8 +1003,7 @@ def get_player_stats_for_friends(user_id):
                    ROUND(AVG(mp.wuerfe), 2) AS "Ø Würfe",
                    ROUND(SUM(mp.treffer) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Trefferquote",
                    ROUND(AVG(mp.strafrunden), 2) AS "Ø Strafrunden",
-                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt",
-                   ROUND(SUM(mp.strafrunden) * 1.0 / NULLIF(SUM(mp.wuerfe), 0), 3) AS "Strafrundenquote"
+                   COALESCE(SUM(mp.strafrunden), 0) AS "Strafrunden Gesamt"
             FROM match_participants mp
             JOIN matches m ON mp.match_id = m.id AND m.status = 'abgeschlossen'
             JOIN users u ON mp.user_id = u.id
@@ -1115,7 +1113,7 @@ Mehr Bierball = Mehr Gut
 
 **Tiebreaker bei gleichem Score**
 
-Bei identischem Wilson-Score entscheiden Trefferquote und Strafrundenquote gleichwertig über die Platzierung.
+Bei identischem Wilson-Score entscheiden Trefferquote und durchschnittliche Strafrunden gleichwertig über die Platzierung.
             """
         )
 
@@ -1631,6 +1629,17 @@ with tabs[1]:
             friend_row = get_user(fid)
             if friend_row:
                 st.divider()
+
+                friend_profile_icon_id = get_user_icon_id(fid)
+                fp_center_col1, fp_center_col2, fp_center_col3 = st.columns([1, 2, 1])
+                with fp_center_col2:
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:center;">'
+                        f'{render_profile_icon_html(friend_profile_icon_id, size_px=200)}'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
                 st.subheader(f"Profil von {friend_row[2]}")
                 if st.button("Schließen", key="close_friend_profile"):
                     st.session_state.selected_friend_id = None
@@ -1647,7 +1656,7 @@ with tabs[1]:
                     c3.metric("Trefferquote", f"{fr_row['Trefferquote']*100:.1f}%" if pd.notna(fr_row["Trefferquote"]) else "–")
                     c4.metric("Strafrunden gesamt", int(fr_row["Strafrunden Gesamt"]))
 
-                st.markdown("**Alle Spiele, an denen dieser Nutzer teilgenommen hat (zur Transparenz sichtbar für alle Freunde):**")
+                st.markdown("**Teilgenommene Spiele:**")
                 friend_matches = get_full_match_list_for_user(fid)
                 if friend_matches.empty:
                     st.caption("Keine abgeschlossenen Spiele.")
