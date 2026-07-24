@@ -171,6 +171,16 @@ def init_db():
     c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS icon_id INTEGER")
     conn.commit()
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            favorite_id INTEGER NOT NULL REFERENCES users(id),
+            UNIQUE(user_id, favorite_id)
+        )
+    """)
+    conn.commit()
+
     c.execute("SELECT COUNT(*) FROM rulesets")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -494,14 +504,45 @@ def get_pending_friend_requests(user_id):
 def get_friends(user_id):
     conn = get_conn()
     try:
-        df = pd.read_sql("""
-            SELECT u.id, u.display_name, u.username FROM friendships f
-            JOIN users u ON u.id = (CASE WHEN f.user_id = %s THEN f.friend_id ELSE f.user_id END)
-            WHERE (f.user_id = %s OR f.friend_id = %s) AND f.status = 'akzeptiert'
-        """, conn, params=(user_id, user_id, user_id))
+        favorite_ids = set(get_favorite_ids(user_id))
+        df = pd.read_sql(
+            "SELECT id, display_name, username FROM users WHERE id != %s",
+            conn, params=(user_id,)
+        )
     finally:
         conn.close()
+    if not df.empty:
+        df["is_favorite"] = df["id"].apply(lambda uid: int(uid) in favorite_ids)
+        df = df.sort_values(by=["is_favorite", "display_name"], ascending=[False, True]).reset_index(drop=True)
     return df
+
+def get_favorite_ids(user_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT favorite_id FROM favorites WHERE user_id = %s", (user_id,))
+        rows = c.fetchall()
+    finally:
+        conn.close()
+    return [int(r[0]) for r in rows]
+
+def is_favorite(user_id, target_id):
+    return int(target_id) in set(get_favorite_ids(user_id))
+
+@retry_db_write()
+def toggle_favorite(user_id, target_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM favorites WHERE user_id = %s AND favorite_id = %s", (user_id, target_id))
+        exists = c.fetchone() is not None
+        if exists:
+            c.execute("DELETE FROM favorites WHERE user_id = %s AND favorite_id = %s", (user_id, target_id))
+        else:
+            c.execute("INSERT INTO favorites (user_id, favorite_id) VALUES (%s, %s)", (user_id, target_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 def create_group(name, creator_id):
     conn = get_conn()
@@ -725,6 +766,18 @@ def render_profile_icon_html(icon_id, size_px=48):
         f'display:inline-flex;align-items:center;justify-content:center;color:#ffffff;'
         f'font-size:{max(8, size_px // 6)}px;font-weight:600;text-align:center;line-height:1;'
         f'vertical-align:middle;">NO ICON</div>'
+    )
+
+def render_ranking_with_favorite_stars(ranked_df_with_id, user_id, columns_to_show):
+    favorite_ids = set(get_favorite_ids(user_id))
+    display_df = ranked_df_with_id.copy()
+    display_df.insert(1, "⭐", display_df["id"].apply(lambda uid: "⭐" if int(uid) in favorite_ids else ""))
+    display_df = display_df[["⭐"] + columns_to_show]
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"⭐": st.column_config.TextColumn("⭐", width="small")}
     )
 
 def apply_ranking_sort(df):
@@ -1393,7 +1446,6 @@ st.markdown(
 if st.button("🔄 Aktualisieren", key="manual_refresh_btn"):
     st.rerun()
 
-pending_friend_count = len(get_pending_friend_requests(user_id))
 pending_invite_count = len(get_pending_invites(user_id)) + len(get_pending_group_invites(user_id))
 
 all_matches_feed = get_all_matches_feed()
@@ -1402,7 +1454,7 @@ if "last_seen_matches_total" not in st.session_state:
     st.session_state.last_seen_matches_total = current_matches_total
 new_matches_count = max(0, current_matches_total - st.session_state.last_seen_matches_total)
 
-freunde_label = f"Freunde 🔴{pending_friend_count}" if pending_friend_count > 0 else "Freunde"
+freunde_label = "Gegner"
 einladungen_label = f"Einladungen 🔴{pending_invite_count}" if pending_invite_count > 0 else "Einladungen"
 spiele_label = f"Spiele 🔴{new_matches_count}" if new_matches_count > 0 else "Spiele"
 
@@ -1517,46 +1569,10 @@ with tabs[0]:
         c3.metric("Trefferquote", f"{r['Trefferquote']*100:.1f}%" if pd.notna(r["Trefferquote"]) else "–")
         c4.metric("Strafrunden gesamt", int(r["Strafrunden Gesamt"]))
 
-# --- TAB: Freunde ---
+# --- TAB: Gegner ---
 with tabs[1]:
-    st.header("Freunde verwalten")
-
-    st.subheader("Neue Freunde finden")
-    search_query = st.text_input("Nutzer suchen (Benutzername oder Anzeigename)")
-    if search_query.strip():
-        results = search_users(search_query.strip(), user_id)
-        if results.empty:
-            st.info("Keine Nutzer gefunden.")
-        else:
-            for _, r in results.iterrows():
-                c1, c2 = st.columns([4, 1])
-                with c1:
-                    st.write(f"{r['display_name']} (@{r['username']})")
-                with c2:
-                    if st.button("Anfrage senden", key=f"friend_req_{r['id']}"):
-                        if send_friend_request(user_id, int(r["id"])):
-                            st.success("Freundschaftsanfrage gesendet.")
-                        else:
-                            st.warning("Anfrage existiert bereits oder ihr seid schon Freunde.")
-
-    st.divider()
-    st.subheader("Offene Freundschaftsanfragen")
-    pending = get_pending_friend_requests(user_id)
-    if pending.empty:
-        st.caption("Keine offenen Anfragen.")
-    else:
-        for _, r in pending.iterrows():
-            c1, c2, c3 = st.columns([3, 1, 1])
-            with c1:
-                st.write(f"{r['display_name']} (@{r['username']})")
-            with c2:
-                if st.button("Annehmen", key=f"accept_{r['id']}"):
-                    respond_friend_request(int(r["id"]), True)
-                    st.rerun()
-            with c3:
-                if st.button("Ablehnen", key=f"decline_{r['id']}"):
-                    respond_friend_request(int(r["id"]), False)
-                    st.rerun()
+    st.header("Gegner")
+    st.caption("Jeder registrierte Nutzer ist automatisch dein Gegner. Markiere Favoriten mit ⭐, um sie oben anzupinnen.")
 
     st.divider()
     st.subheader("Von mir erteilte temporäre Zugriffe")
@@ -1575,20 +1591,28 @@ with tabs[1]:
                     st.rerun()
 
     st.divider()
-    st.subheader("Meine Freunde")
+    st.subheader("Alle Gegner")
     friends_df = get_friends(user_id)
     if friends_df.empty:
-        st.caption("Noch keine Freunde hinzugefügt.")
+        st.caption("Keine anderen Nutzer registriert.")
     else:
         if "selected_friend_id" not in st.session_state:
             st.session_state.selected_friend_id = None
 
         friend_icon_lookup = get_icon_ids_for_users(friends_df["id"].tolist())
+        current_favorite_ids = set(get_favorite_ids(user_id))
 
         for _, fr in friends_df.iterrows():
-            fr_icon_id = friend_icon_lookup.get(int(fr["id"]))
+            fr_id = int(fr["id"])
+            fr_icon_id = friend_icon_lookup.get(fr_id)
+            fr_is_fav = fr_id in current_favorite_ids
             with st.container(border=True):
-                name_row_icon_col, name_row_text_col = st.columns([1, 4])
+                fav_col, name_row_icon_col, name_row_text_col = st.columns([0.5, 1, 3.5])
+                with fav_col:
+                    fav_icon_label = "⭐" if fr_is_fav else "☆"
+                    if st.button(fav_icon_label, key=f"toggle_fav_{fr_id}"):
+                        toggle_favorite(user_id, fr_id)
+                        st.rerun()
                 with name_row_icon_col:
                     st.markdown(render_profile_icon_html(fr_icon_id, size_px=40), unsafe_allow_html=True)
                 with name_row_text_col:
@@ -1670,7 +1694,7 @@ with tabs[1]:
 
     st.divider()
     st.subheader("Meine Gruppen")
-    st.caption("Erstelle Gruppen mit deinen Freunden. Spiele, bei denen alle Mitspieler Mitglieder derselben Gruppe sind, werden automatisch in der Gruppenstatistik erfasst.")
+    st.caption("Erstelle Gruppen mit deinen Gegnern. Spiele, bei denen alle Mitspieler Mitglieder derselben Gruppe sind, werden automatisch in der Gruppenstatistik erfasst.")
 
     with st.expander("➕ Neue Gruppe erstellen"):
         new_group_name = st.text_input("Gruppenname", key="new_group_name_input")
@@ -1696,7 +1720,7 @@ with tabs[1]:
 
                 invitable_friends = friends_for_invite_df.loc[~friends_for_invite_df["id"].isin(members_df["id"])]
                 if not invitable_friends.empty:
-                    invite_name = st.selectbox("Freund einladen", invitable_friends["display_name"].tolist(), key=f"group_invite_select_{gid}")
+                    invite_name = st.selectbox("Gegner einladen", invitable_friends["display_name"].tolist(), key=f"group_invite_select_{gid}")
                     if st.button("Einladen", key=f"group_invite_btn_{gid}"):
                         invite_uid = int(invitable_friends.loc[invitable_friends["display_name"] == invite_name, "id"].iloc[0])
                         if invite_to_group(gid, invite_uid, user_id):
@@ -1705,7 +1729,7 @@ with tabs[1]:
                         else:
                             st.warning("Diese Person wurde bereits eingeladen oder ist bereits Mitglied.")
                 else:
-                    st.caption("Alle deine Freunde sind bereits in dieser Gruppe oder du hast keine weiteren Freunde zum Einladen.")
+                    st.caption("Alle Gegner sind bereits in dieser Gruppe oder es gibt keine weiteren Nutzer zum Einladen.")
 
 # --- TAB: Neues Spiel ---
 with tabs[2]:
@@ -1714,7 +1738,7 @@ with tabs[2]:
     rulesets_df = get_rulesets()
 
     if friends_df.empty:
-        st.info("Du brauchst mindestens einen Freund, um ein Spiel zu starten. Füge zuerst Freunde im Tab 'Freunde' hinzu.")
+        st.info("Es gibt noch keine anderen registrierten Nutzer, um ein Spiel zu starten.")
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -2028,16 +2052,17 @@ with tabs[5]:
     else:
         ranked_df = stats_df.reset_index(drop=True)
         ranked_df.insert(0, "Rang", ranked_df.index + 1)
-        display_ranked = ranked_df.drop(columns=["id"]).copy()
-        display_ranked["Siegquote"] = (display_ranked["Siegquote"] * 100).round(1).astype(str) + " %"
-        st.dataframe(display_ranked, use_container_width=True, hide_index=True)
+        gesamt_display_for_render = ranked_df.copy()
+        gesamt_display_for_render["Siegquote"] = (gesamt_display_for_render["Siegquote"] * 100).round(1).astype(str) + " %"
+        gesamt_columns_to_show = [c for c in gesamt_display_for_render.columns if c != "id"]
+        render_ranking_with_favorite_stars(gesamt_display_for_render, user_id, gesamt_columns_to_show)
 
         st.divider()
         st.header("Meine Gruppen")
         my_groups_rangliste_df = get_my_groups(user_id)
         group_stats_lookup = {}
         if my_groups_rangliste_df.empty:
-            st.caption("Du bist noch in keiner Gruppe. Erstelle eine Gruppe im Tab 'Freunde'.")
+            st.caption("Du bist noch in keiner Gruppe. Erstelle eine Gruppe im Tab 'Gegner'.")
         else:
             for _, grp in my_groups_rangliste_df.iterrows():
                 gid = int(grp["id"])
@@ -2055,9 +2080,10 @@ with tabs[5]:
                     group_ranked_df = group_stats_df.reset_index(drop=True)
                     group_ranked_df.insert(0, "Rang", group_ranked_df.index + 1)
                     group_stats_lookup[gid] = group_ranked_df
-                    display_group_ranked = group_ranked_df.drop(columns=["id"]).copy()
-                    display_group_ranked["Siegquote"] = (display_group_ranked["Siegquote"] * 100).round(1).astype(str) + " %"
-                    st.dataframe(display_group_ranked, use_container_width=True, hide_index=True)
+                    group_display_for_render = group_ranked_df.copy()
+                    group_display_for_render["Siegquote"] = (group_display_for_render["Siegquote"] * 100).round(1).astype(str) + " %"
+                    group_columns_to_show = [c for c in group_display_for_render.columns if c != "id"]
+                    render_ranking_with_favorite_stars(group_display_for_render, user_id, group_columns_to_show)
 
         st.divider()
         st.header("Individuelle Statistiken")
@@ -2239,6 +2265,4 @@ if is_admin_user:
                     else:
                         if st.button("Löschen", key=f"admin_del_group_{gid}"):
                             st.session_state[confirm_group_key] = True
-                            st.rerun()
-
-st.session_state.last_seen_matches_total = current_matches_total
+                           
